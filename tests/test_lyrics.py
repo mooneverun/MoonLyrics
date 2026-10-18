@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import requests
 
-from moonlyrics.lyrics import Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track, match_rank, normalize, parse_lrc
+from moonlyrics.lyrics import Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track, match_rank, normalize, parse_lrc, related_artist_name
 
 SAMPLE = "[00:01.00]窗前的月光\n[00:03.50]慢慢经过身旁\n[00:06.00]\n[00:08.00]下一句轻轻唱"
 
@@ -66,6 +66,13 @@ class MatchingTests(TestCase):
         self.assertIsNotNone(match_rank(Track("Yellow", "Coldplay", duration=267), [target]))
         self.assertIsNone(match_rank(Track("江南", "林俊杰", duration=267), [Track("江南", "JJ Lin", duration=267)]))
 
+    def test_stage_name_relation_is_only_a_conservative_candidate_filter(self):
+        for left, right in (("連麻", "连麻Swimming"), ("艾志恒", "艾志恒Asen"), ("邓紫棋", "G.E.M.邓紫棋")):
+            self.assertTrue(related_artist_name(left, right))
+        for left, right in (("林俊杰", "林俊林"), ("王", "王Luna"), ("连麻", "连麻Cover"),
+                            ("连麻", "连麻 & Swimming"), ("连麻Swimming", "连麻Moon"), ("JJ Lin", "林俊杰")):
+            self.assertFalse(related_artist_name(left, right))
+
 
 class FinderTests(TestCase):
     def setUp(self):
@@ -115,10 +122,13 @@ class FinderTests(TestCase):
         self.assertEqual(self.finder._json.call_args.kwargs["id"], "correct")
         self.assertEqual(self.finder._json.call_args_list[0].kwargs["keyword"], "歌手 - 月光")
 
-    def test_verified_artist_name_finds_kugou_lyrics_for_traditional_apple_metadata(self):
+    def test_catalog_resolves_artist_name_for_traditional_apple_metadata(self):
         track = Track("譚sir", "連麻", "譚sir - Single", 171)
         payload = base64.b64encode(SAMPLE.encode()).decode()
         def response(url, **params):
+            if "songsearch.kugou.com" in url:
+                return dict(status=1, data=dict(lists=[dict(SingerName="连麻Swimming", SingerId=[790800]),
+                                                      dict(SingerName="连麻", SingerId=[17067849])]))
             if url.endswith("/download"):
                 return dict(content=payload)
             candidates = [dict(id="cover", accesskey="test", song="谭sir", singer="连麻Cover", duration=171720),
@@ -131,6 +141,49 @@ class FinderTests(TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found.artist, "连麻Swimming")
         self.assertEqual(self.finder._json.call_args.kwargs["id"], "correct")
+        self.assertTrue(any("songsearch.kugou.com" in call.args[0] for call in self.finder._json.call_args_list))
+
+    def mock_artist_catalog(self, track, records, duration=100300):
+        payload = base64.b64encode(SAMPLE.encode()).decode()
+        def response(url, **params):
+            if "songsearch.kugou.com" in url:
+                return dict(status=1, data=dict(lists=records))
+            if url.endswith("/download"):
+                return dict(content=payload)
+            candidate = dict(id="correct", accesskey="test", song=track.title, singer="月光诗人Luna", duration=duration)
+            return dict(status=200, candidates=[candidate] if params.get("keyword") == "月光诗人Luna - 月光" else [])
+        self.finder._json = Mock(side_effect=response)
+        self.finder._lrclib = Mock(return_value=None)
+        self.finder._aliases = Mock(return_value=[track])
+
+    def test_catalog_recognizes_an_unlisted_stage_name(self):
+        track = Track("月光", "月光诗人", duration=100)
+        self.mock_artist_catalog(track, [dict(SingerName="月光诗人Luna", SingerId=[123])])
+        found, _ = self.finder.find(track)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.artist, "月光诗人Luna")
+
+    def test_catalog_rejects_covers_collaborations_unknown_ids_and_ambiguous_names(self):
+        track = Track("月光", "月光诗人", duration=100)
+        cases = [None, [], [None], ["malformed"], [dict(SingerName="月光诗人Cover", SingerId=[123])],
+                 [dict(SingerName="月光诗人Luna、他人", SingerId=[123, 456])],
+                 [dict(SingerName="月光诗人Luna", SingerId=[0])],
+                 [dict(SingerName="月光诗人Luna", SingerId=[True])],
+                 [dict(SingerName="其他诗人Luna", SingerId=[123])],
+                 [dict(SingerName="月光诗人Luna", SingerId=[123]), dict(SingerName="月光诗人Moon", SingerId=[456])],
+                 [dict(SingerName="月光诗人Luna", SingerId=[123]), dict(SingerName="月光诗人Luna", SingerId=[456])]]
+        for records in cases:
+            with self.subTest(records=records):
+                self.mock_artist_catalog(track, records)
+                found, _ = self.finder.find(track, force=True)
+                self.assertIsNone(found)
+                self.assertFalse(any(call.args[0].endswith("/download") for call in self.finder._json.call_args_list))
+
+    def test_automatically_discovered_name_requires_a_closer_duration(self):
+        track = Track("月光", "月光诗人", duration=100)
+        self.mock_artist_catalog(track, [dict(SingerName="月光诗人Luna", SingerId=[123])], duration=103000)
+        found, _ = self.finder.find(track)
+        self.assertIsNone(found)
 
     def test_cache_prevents_repeated_network_search_and_can_be_retried(self):
         document = Lyrics(parse_lrc(SAMPLE), "测试")

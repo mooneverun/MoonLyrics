@@ -2,6 +2,7 @@
 import base64
 from bisect import bisect_right
 from dataclasses import dataclass
+import html
 import logging
 import re
 import time
@@ -17,8 +18,6 @@ _simplified, _traditional = OpenCC("t2s"), OpenCC("s2t")
 _stamp = re.compile(r"\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]")
 _word_stamp = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d+)?>")
 _remaster = re.compile(r"\s*[\[(（][^\])）]*(?:remaster|重制|重製)[^\])）]*[\])）]|\s*[-–—]\s*(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?", re.I)
-# Verified performer names: Apple lists 連麻; KuGou's artist profile lists 连麻Swimming.
-_verified_artist_names = {"连麻": ("连麻Swimming",), "连麻swimming": ("连麻",)}
 
 
 def normalize(text):
@@ -43,9 +42,18 @@ class Track:
     duration: float = 0.
 
 
-def _known_aliases(track):
-    return [track] + [Track(track.title, name, track.album, track.duration)
-                      for name in _verified_artist_names.get(normalize(track.artist), ())]
+def related_artist_name(left, right):
+    """A Chinese name plus a Latin stage name is a candidate, never proof by itself."""
+    if re.search(r"[、,，&/+＋;；|]", str(left) + str(right)):
+        return False
+    left, right = normalize(left), normalize(right)
+    chinese = lambda value: "".join(c for c in value if "\u3400" <= c <= "\u9fff")
+    base = chinese(left)
+    if left == right or len(base) < 2 or base != chinese(right) or base not in (left, right):
+        return False
+    if any(marker in left + right for marker in ("cover", "remix", "karaoke", "instrumental", "tribute", "翻唱", "粉丝", "原唱", "feat")):
+        return False
+    return bool(re.fullmatch(r"[a-z0-9\u3400-\u9fff]+", left) and re.fullmatch(r"[a-z0-9\u3400-\u9fff]+", right))
 
 
 @dataclass(frozen=True)
@@ -101,7 +109,7 @@ def parse_lrc(text):
     return lines if any(line.text for line in lines) else ()
 
 
-def match_rank(candidate, aliases):
+def match_rank(candidate, aliases, tolerance=5):
     """Title AND artist must agree; duration rejects different recordings."""
     ranks = []
     if not candidate.title or not candidate.artist:
@@ -112,7 +120,7 @@ def match_rank(candidate, aliases):
         if normalize(candidate.artist) != normalize(expected.artist):
             continue
         difference = abs(candidate.duration - expected.duration)
-        if expected.duration > 0 and (candidate.duration <= 0 or difference > 5):
+        if expected.duration > 0 and (candidate.duration <= 0 or difference > tolerance):
             continue
         ranks.append((normalize(candidate.album) != normalize(expected.album), difference))
     return min(ranks) if ranks else None
@@ -161,7 +169,7 @@ class LyricsFinder:
         key = track, storefront
         if key in self.alias_cache:
             return self.alias_cache[key]
-        aliases = _known_aliases(track)
+        aliases = [track]
         try:
             payload = self._json("https://itunes.apple.com/search", term=f"{track.title} {track.artist}",
                                  country=storefront, entity="song", limit=25)
@@ -175,9 +183,9 @@ class LyricsFinder:
                     for found_id, candidate in self._apple_tracks(localized):
                         if found_id != identifier or abs(candidate.duration - original.duration) > 1:
                             continue
-                        for alias in _known_aliases(candidate):
-                            if alias not in aliases:
-                                aliases.append(alias)
+                        if not any(normalize(candidate.title) == normalize(alias.title)
+                                   and normalize(candidate.artist) == normalize(alias.artist) for alias in aliases):
+                            aliases.append(candidate)
                     if any(has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
         except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -188,7 +196,49 @@ class LyricsFinder:
         self.alias_cache[key] = aliases
         return aliases
 
-    def _kugou(self, aliases):
+    def _catalog_aliases(self, aliases):
+        expanded = list(aliases)
+        artists = {normalize(track.artist): track.artist for track in aliases if has_chinese(track.artist)}
+        for artist in list(artists.values())[:2]:
+            try:
+                data = self._json("https://songsearch.kugou.com/song_search_v2",
+                                  keyword=_simplified.convert(artist), page=1, pagesize=30)
+                if not isinstance(data, dict) or data.get("status") != 1 or not isinstance(data.get("data"), dict):
+                    continue
+                records = data["data"].get("lists")
+                if not isinstance(records, list):
+                    continue
+                candidates = {}
+                for item in records[:30]:
+                    if not isinstance(item, dict) or not isinstance(item.get("SingerName"), str):
+                        continue
+                    name = html.unescape(re.sub(r"<[^>]+>", "", item["SingerName"])).strip()
+                    identifiers = item.get("SingerId")
+                    if (len(name) > 128 or not related_artist_name(artist, name)
+                            or not isinstance(identifiers, list) or len(identifiers) != 1):
+                        continue
+                    identifier = identifiers[0]
+                    if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier <= 0:
+                        continue
+                    key = normalize(name)
+                    if key not in candidates:
+                        candidates[key] = (name, set())
+                    candidates[key][1].add(identifier)
+                # Multiple names or performer IDs are ambiguous, even when their spelling is close.
+                if len(candidates) != 1:
+                    continue
+                name, identifiers = next(iter(candidates.values()))
+                if len(identifiers) != 1:
+                    continue
+                for track in aliases:
+                    candidate = Track(track.title, name, track.album, track.duration)
+                    if candidate not in expanded:
+                        expanded.append(candidate)
+            except (requests.RequestException, ValueError, TypeError, KeyError):
+                LOG.debug("Artist catalog lookup unavailable", exc_info=True)
+        return expanded
+
+    def _kugou(self, aliases, tolerance=5):
         queries = list(dict.fromkeys(_simplified.convert(f"{t.artist} - {t.title}").strip() for t in reversed(aliases)))
         for query in queries[:2]:
             try:
@@ -206,7 +256,7 @@ class LyricsFinder:
                         continue
                     candidate = Track(str(item.get("song") or ""), str(item.get("singer") or ""),
                                       duration=finite(item.get("duration")) / 1000)
-                    rank = match_rank(candidate, aliases)
+                    rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None and item.get("id") and item.get("accesskey"):
                         matches.append((rank, item, candidate))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0])[:2]:
@@ -222,7 +272,7 @@ class LyricsFinder:
                 LOG.debug("KuGou lyrics unavailable", exc_info=True)
         return None
 
-    def _lrclib(self, aliases):
+    def _lrclib(self, aliases, tolerance=5):
         titles = []
         for track in reversed(aliases):
             titles.extend((track.title, _simplified.convert(track.title), _traditional.convert(track.title)))
@@ -241,7 +291,7 @@ class LyricsFinder:
                         continue
                     candidate = Track(str(item.get("trackName") or ""), str(item.get("artistName") or ""),
                                       str(item.get("albumName") or ""), finite(item.get("duration")))
-                    rank = match_rank(candidate, aliases)
+                    rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None:
                         matches.append((rank, item, candidate))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0]):
@@ -263,7 +313,7 @@ class LyricsFinder:
         self.cache.pop(key, None)
         try:
             self._check()
-            base_aliases = _known_aliases(track)
+            base_aliases = [track]
             aliases = base_aliases
             mixed = has_chinese(track.title + track.artist + track.album) and not (
                 has_chinese(track.title) and has_chinese(track.artist))
@@ -276,6 +326,12 @@ class LyricsFinder:
                 aliases = self._aliases(track, storefront)
                 if aliases != base_aliases:
                     result = self._kugou(aliases) or self._lrclib(aliases)
+            if result is None:
+                expanded = self._catalog_aliases(aliases)
+                if expanded != aliases:
+                    result = self._kugou(expanded, tolerance=2) or self._lrclib(expanded, tolerance=2)
+                    if result is not None:
+                        self.alias_cache[key] = expanded
             self._check()
             if result:
                 if len(self.cache) >= 64:
