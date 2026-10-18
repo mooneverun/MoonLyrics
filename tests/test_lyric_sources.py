@@ -63,11 +63,42 @@ class ArtistIdentityTests(TestCase):
         self.assertIsNotNone(document)
         self.assertEqual(document.source, "QQ音乐")
 
+    def test_qq_resolves_localized_feature_with_affiliation_against_source_identities(self):
+        song = dict(mid="songmid", name="달빛 (Moonlight) (feat. 달게스트 of Group)",
+                    singer=[dict(mid="leadmid", name="Lead Name"), dict(mid="guestmid", name="Star Guest")],
+                    album=dict(name="Album"), interval=100)
+        def response(url, **params):
+            if "musicu.fcg" in url:
+                request = params["body"]["req"]
+                if request["method"] == "GetSingerDetail":
+                    self.assertEqual(request["param"]["singer_mids"], ["guestmid"])
+                    return dict(code=0, req=dict(code=0, data=dict(singer_list=[dict(
+                        basic_info=dict(singer_mid="guestmid", name="Star Guest (달게스트)"),
+                        ex_info=dict(foreign_name="달게스트"))])))
+                return dict(code=0, req=dict(code=0, data=dict(body=dict(song=dict(list=[song])))))
+            return dict(code=0, lyric=LRC)
+        self.finder._json = Mock(side_effect=response)
+        document = self.finder._qq(self.aliases)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.source, "QQ音乐")
+
     def test_wrong_profile_identity_or_name_is_not_used_as_an_alias(self):
         for invalid in (self.profile(identifier=99), self.profile(name="另一位歌手"),
                         dict(code=200, artist=None), dict(code=200, artist=dict(id=True, name="合作歌手", trans="달게스트"))):
             self.finder._json = Mock(return_value=invalid)
             self.assertIsNone(self.finder._artist_profile("netease", dict(id=12, name="合作歌手")))
+
+    def test_affiliations_cannot_hide_unknown_guests_or_shorten_primary_artists(self):
+        self.finder._artist_profile = Mock(return_value=frozenset())
+        for title in ("Moonlight (feat. Stranger of Group)",
+                      "Moonlight (feat. Star Guest of Group & Stranger)"):
+            candidate = Track(title, "Lead Name & Star Guest", "Album", 100)
+            records = [dict(mid="leadmid", name="Lead Name"), dict(mid="guestmid", name="Star Guest")]
+            self.assertEqual(list(self.finder._source_matches("qq", [((False, 0), "songmid", candidate, records)], self.aliases)), [])
+        candidate = Track("Moonlight", "Boards of Canada", duration=100)
+        records = [dict(mid="bandmid", name="Boards of Canada")]
+        self.assertEqual(list(self.finder._source_matches("qq", [((False, 0), "songmid", candidate, records)],
+                                                         [Track("Moonlight", "Boards", duration=100)])), [])
 
     def test_positive_profiles_are_cached_and_failed_lookups_can_recover(self):
         self.finder._json = Mock(side_effect=[requests.ConnectionError("temporary"), self.profile()])

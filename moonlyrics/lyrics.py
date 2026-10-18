@@ -61,11 +61,15 @@ def bilingual_parts(text):
     return ()
 
 
-def artist_parts(value):
+def artist_parts(value, *, affiliations=False):
     parts = []
     for part in re.split(r"\s*(?:[,&、，;；]|\b(?:feat(?:uring)?|ft)\.?\s+)\s*",
                          unicodedata.normalize("NFKC", value), flags=re.I):
         keys = {normalize(name) for name in (part, *bilingual_parts(part)) if normalize(name)}
+        if affiliations:
+            credit = re.fullmatch(r"(.+?)\s+of\s+\S.*", part, re.I)
+            if credit:
+                keys.update(normalize(name) for name in (credit[1], *bilingual_parts(credit[1])) if normalize(name))
         if keys and not any(keys & known for known in parts):
             parts.append(keys)
     return parts
@@ -301,6 +305,38 @@ class LyricsFinder:
             matches = [(match_rank(candidate, [track]), identifier, candidate)
                        for identifier, candidate in self._apple_tracks(payload)]
             matches = [item for item in matches if item[0] is not None and item[1]]
+            if not matches and normalize(track.album) and track.duration > 0:
+                # Song search may omit the vocal recording while the public album still lists it.
+                catalog = self._json("https://itunes.apple.com/search", term=f"{track.artist} {track.album}",
+                                     country=storefront, entity="song", limit=25)
+                albums = catalog.get("results") if isinstance(catalog, dict) else None
+                if not isinstance(albums, list):
+                    self.failures.add("Apple album names")
+                    albums = []
+                identifiers = []
+                for album in albums[:10]:
+                    if (not isinstance(album, dict) or normalize(album.get("collectionName")) != normalize(track.album)
+                            or not isinstance(album.get("artistName"), str) or not same_artists(album["artistName"], track.artist)):
+                        continue
+                    identifier = album.get("collectionId")
+                    if type(identifier) is int and 0 < identifier < 10 ** 15 and identifier not in identifiers:
+                        identifiers.append(identifier)
+                for album_id in identifiers[:2]:
+                    try:
+                        catalog = self._json("https://itunes.apple.com/lookup", id=album_id, country=storefront, entity="song")
+                        songs = catalog.get("results") if isinstance(catalog, dict) else None
+                        if not isinstance(songs, list):
+                            self.failures.add("Apple album names")
+                            continue
+                        songs = [item for item in songs if isinstance(item, dict) and item.get("collectionId") == album_id]
+                        matches = [(match_rank(candidate, [track]), identifier, candidate)
+                                   for identifier, candidate in self._apple_tracks(dict(results=songs))]
+                        matches = [item for item in matches if item[0] is not None and item[1]]
+                        if matches:
+                            LOG.info("Recording recovered from Apple album: album_id=%s", album_id)
+                            break
+                    except (requests.RequestException, ValueError, TypeError, KeyError):
+                        self.failures.add("Apple album names")
             if matches:
                 _, identifier, original = min(matches, key=lambda item: item[0])
                 chinese = has_chinese(track.title + track.artist + track.album)
@@ -532,6 +568,7 @@ class LyricsFinder:
     def _source_matches(self, provider, matches, aliases):
         rosters = recording_rosters(aliases)
         known = set().union(*(part for roster in rosters for part in roster))
+        known_guests = set().union(*(part for alias in aliases for part in artist_parts(split_credit(alias.title)[1]))) or known
         # Verify and download lazily: a slow later profile must not discard an earlier valid song.
         ordered = sorted(matches, key=lambda item: (match_rank(item[2], aliases) is None, item[0]))
         for rank, identifier, candidate, records in ordered[:6]:
@@ -550,17 +587,21 @@ class LyricsFinder:
             if len(identities) == len(records) and match_rank(candidate, aliases) is not None:
                 yield rank, identifier, candidate
                 continue
-            guests = artist_parts(split_credit(candidate.title)[1])
-            groups.extend(part for part in guests if not any(part & names for names in groups))
-            if not rosters or len(groups) != len(rosters[0]) or len(groups) > 16:
+            # Only featured credits may carry "of <group>"; primary artist names stay intact.
+            guests = artist_parts(split_credit(candidate.title)[1], affiliations=True)
+            if (not rosters or len(groups) > len(rosters[0])
+                    or len(groups) + len(guests) < len(rosters[0]) or len(groups) > 16):
                 continue
+            unresolved_guests = any(not any(part & names for names in groups) for part in guests)
             for index, identity in enumerate(identities):
-                if groups[index] & known or identity is None:
+                needs_credit_alias = unresolved_guests and bool(groups[index] & known_guests)
+                if identity is None or (groups[index] & known and not needs_credit_alias):
                     continue
                 record = next(record for record in records if self._artist_id(provider, record) == identity)
                 names = self._artist_profile(provider, record)
                 if names:
                     groups[index].update(names)
+            groups.extend(part for part in guests if not any(part & names for names in groups))
             if any(same_artist_groups(groups, roster) for roster in rosters):
                 yield rank, identifier, candidate
 

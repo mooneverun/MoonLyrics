@@ -1,4 +1,5 @@
 import base64
+import time
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -217,6 +218,60 @@ class FinderTests(TestCase):
         found, _ = self.finder.find(Track("Far Away", "Sam Lee", duration=270))
         self.assertIsNone(found)
         self.assertEqual(self.finder._json.call_count, 1)
+
+    def test_album_lookup_recovers_a_recording_missing_from_song_search(self):
+        track = Track("Moonlight (feat. Guest)", "Luna", "Album", 100)
+        vocal = self.apple_record(42, track.title, track.artist, 100000); vocal["collectionId"] = 50
+        instrumental = self.apple_record(43, "Moonlight (Instrumental)", track.artist, 90000); instrumental["collectionId"] = 50
+        localized = self.apple_record(42, "달빛 (feat. 게스트)", "루나", 100000)
+        def response(url, **params):
+            if params.get("term") == "Luna Album":
+                return dict(results=[instrumental])
+            if params.get("id") == 50:
+                return dict(results=[instrumental, vocal])
+            if params.get("id") == 42:
+                return dict(results=[localized])
+            return dict(results=[])
+        self.finder._json = Mock(side_effect=response)
+        document = Lyrics(parse_lrc(SAMPLE), "测试")
+        self.finder._kugou = Mock(side_effect=lambda aliases, **kwargs: document if len(aliases) > 1 else None)
+        self.finder._lrclib = Mock(return_value=None)
+        found, _ = self.finder.find(track)
+        self.assertIs(found, document)
+        self.assertEqual(self.finder._kugou.call_args.args[0][1].title, localized["trackName"])
+        self.assertEqual(self.finder._json.call_args.kwargs["id"], 42)
+
+    def test_album_fallback_rejects_unrelated_albums_and_wrong_recordings(self):
+        track = Track("Moonlight (feat. Guest)", "Luna", "Album", 100)
+        for album in (dict(collectionId=50, collectionName="Other Album", artistName="Luna"),
+                      dict(collectionId=50, collectionName="Album", artistName="Other Artist"),
+                      dict(collectionId=True, collectionName="Album", artistName="Luna")):
+            self.finder._json = Mock(side_effect=[dict(results=[]), dict(results=[album])])
+            self.finder.cancelled = lambda: False
+            self.finder.deadline = time.monotonic() + 20
+            self.assertEqual(self.finder._aliases(track, "tr"), [track])
+            self.assertEqual(self.finder._json.call_count, 2)
+        album = dict(collectionId=50, collectionName="Album", artistName="Luna")
+        for title, duration, collection in (("Moonlight (Instrumental)", 90000, 50),
+                                            (track.title, 115000, 50), (track.title, 100000, 99)):
+            recording = self.apple_record(42, title, "Luna", duration); recording["collectionId"] = collection
+            self.finder._json = Mock(side_effect=[dict(results=[]), dict(results=[album]), dict(results=[recording])])
+            self.assertEqual(self.finder._aliases(track, "tr"), [track])
+            self.assertEqual(self.finder._json.call_count, 3)
+        self.assertNotIn((track, "tr"), self.finder.alias_cache)
+
+    def test_one_failed_album_lookup_does_not_hide_another_matching_album(self):
+        track = Track("Moonlight", "Luna", "Album", 100)
+        recording = self.apple_record(42, "Moonlight", "Luna", 100000); recording["collectionId"] = 51
+        localized = self.apple_record(42, "달빛", "루나", 100000)
+        self.finder._json = Mock(side_effect=[dict(results=[]), dict(results=[
+            dict(collectionId=50, collectionName="Album", artistName="Luna"),
+            dict(collectionId=51, collectionName="Album", artistName="Luna")]),
+            requests.ConnectionError("temporary"), dict(results=[recording]), dict(results=[localized])])
+        self.finder.cancelled = lambda: False
+        self.finder.deadline = time.monotonic() + 20
+        aliases = self.finder._aliases(track, "tr")
+        self.assertEqual(aliases[1].title, "달빛")
 
     def test_provider_failure_falls_back_to_another_source(self):
         document = Lyrics(parse_lrc(SAMPLE), "LRCLIB")
