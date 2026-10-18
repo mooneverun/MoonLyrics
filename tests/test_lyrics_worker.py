@@ -11,6 +11,74 @@ from moonlyrics.lyrics_worker import LyricsWorker
 
 
 class WorkerTests(TestCase):
+    def run_worker(self, finder, expected_results, delays=(.01, .02), after_result=None):
+        app = QCoreApplication.instance() or QCoreApplication([])
+        results = []
+        with patch("moonlyrics.lyrics_worker.LyricsFinder", return_value=finder):
+            worker = LyricsWorker()
+            worker.retry_delays = delays
+            def receive(*result):
+                results.append(result)
+                if after_result:
+                    after_result(worker, result)
+            worker.result_ready.connect(receive)
+            worker.start()
+            try:
+                worker.request(1, Track("旧歌", "歌手", duration=100), "tr")
+                deadline = time.monotonic() + 2
+                while len(results) < expected_results and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertEqual(len(results), expected_results)
+            finally:
+                worker.stop()
+                self.assertTrue(worker.wait(1000))
+        finder.close.assert_called_once()
+        return results
+
+    def test_initial_miss_is_retried_and_recovers_without_user_action(self):
+        document = Lyrics((LyricLine(1, "月光"),), "测试")
+        finder = Mock()
+        finder.find.side_effect = [(None, "暂未找到歌词"), (document, "已匹配")]
+        results = self.run_worker(finder, 2)
+        self.assertIn("自动重试", results[0][2])
+        self.assertIs(results[1][1], document)
+        self.assertEqual(finder.find.call_count, 2)
+        self.assertTrue(finder.find.call_args_list[1].args[3])
+
+    def test_missing_lyrics_have_a_bounded_retry_count(self):
+        finder = Mock()
+        finder.find.return_value = (None, "未找到可靠的同步歌词")
+        results = self.run_worker(finder, 3)
+        self.assertEqual(finder.find.call_count, 3)
+        self.assertTrue(all(result[1] is None for result in results))
+        self.assertNotIn("自动重试", results[-1][2])
+
+    def test_failed_search_exception_can_recover_on_retry(self):
+        document = Lyrics((LyricLine(1, "月光"),), "测试")
+        finder = Mock()
+        finder.find.side_effect = [RuntimeError("temporary failure"), (document, "已匹配")]
+        with self.assertLogs("moonlyrics.lyrics", level="ERROR"):
+            results = self.run_worker(finder, 2)
+        self.assertIs(results[-1][1], document)
+
+    def test_shutdown_interrupts_a_scheduled_retry(self):
+        finder = Mock()
+        finder.find.return_value = (None, "暂未找到")
+        self.run_worker(finder, 1, delays=(10, 10), after_result=lambda worker, result: worker.stop())
+        self.assertEqual(finder.find.call_count, 1)
+
+    def test_new_song_interrupts_a_scheduled_retry_immediately(self):
+        document = Lyrics((LyricLine(1, "月光"),), "测试")
+        finder = Mock()
+        finder.find.side_effect = lambda track, *args: (document, "已匹配") if track.title == "新歌" else (None, "暂未找到")
+        def after_result(worker, result):
+            if result[0] == 1:
+                worker.request(2, Track("新歌", "歌手", duration=100), "tr")
+        results = self.run_worker(finder, 2, delays=(10, 10), after_result=after_result)
+        self.assertEqual([result[0] for result in results], [1, 2])
+        self.assertIs(results[-1][1], document)
+        self.assertEqual(finder.find.call_count, 2)
+
     def test_new_song_cancels_inflight_search_and_is_the_only_result(self):
         app = QCoreApplication.instance() or QCoreApplication([])
         entered, release = threading.Event(), threading.Event()

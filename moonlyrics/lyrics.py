@@ -148,11 +148,17 @@ class LyricsFinder:
 
     def _json(self, url, **params):
         self._check()
-        response = self.session.get(url, params=params, timeout=(2, 4))
-        response.raise_for_status()
-        if len(response.content) > 3_000_000:
-            raise ValueError("Lyrics response is too large")
-        data = response.json()
+        response = None
+        try:
+            response = self.session.get(url, params=params, timeout=(2, 4))
+            response.raise_for_status()
+            if len(response.content) > 3_000_000:
+                raise ValueError("Lyrics response is too large")
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            LOG.info("Lyric request failed: endpoint=%s status=%s error=%s",
+                     url, getattr(response, "status_code", None), type(exc).__name__)
+            raise
         self._check()
         return data
 
@@ -259,6 +265,7 @@ class LyricsFinder:
                     rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None and item.get("id") and item.get("accesskey"):
                         matches.append((rank, item, candidate))
+                LOG.info("Lyric search: provider=KuGou candidates=%s accepted=%s", len(candidates), len(matches))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0])[:2]:
                     payload = self._json("https://lyrics.kugou.com/download", ver=1, client="pc", id=item["id"],
                                          accesskey=item["accesskey"], fmt="lrc", charset="utf8")
@@ -294,6 +301,7 @@ class LyricsFinder:
                     rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None:
                         matches.append((rank, item, candidate))
+                LOG.info("Lyric search: provider=LRCLIB candidates=%s accepted=%s", len(data), len(matches))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0]):
                     lines = parse_lrc(item["syncedLyrics"])
                     if lines:
