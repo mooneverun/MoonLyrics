@@ -25,6 +25,9 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
 from .styles import DEFAULTS, LIMITS, PRESETS, normalized, transparency_amount
 from .playback import PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
+from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
+from .lyrics_worker import LyricsWorker
+from .lyric_paint import lyric_layer
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "MoonLyrics"
 LEGACY_DIR = APP_DIR.parent / "LyricFloatGlassSample"
@@ -242,6 +245,14 @@ class GlassView(QOpenGLWidget):
         self.show_text = True
         self.primary_text = "等待 Apple Music"
         self.secondary_text = "播放音乐后显示歌曲与进度"
+        self.lyrics = None
+        self.scroll_position = -1.
+        self.lyric_index = -1
+        self.lyric_image_key = None
+        self.lyric_animation = QVariantAnimation(self)
+        self.lyric_animation.setDuration(280)
+        self.lyric_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.lyric_animation.valueChanged.connect(self.animate_lyric)
         self.dark_text = False
         self.renderer = "正在初始化显卡…"
         self.light = QVector2D(-.7, .8)
@@ -267,6 +278,34 @@ class GlassView(QOpenGLWidget):
 
     def swapped(self):
         self.frames += 1
+
+    def set_lyrics(self, document, position=0.):
+        self.lyric_animation.stop()
+        self.lyrics = document
+        self.lyric_index = document.index_at(position) if document else -1
+        self.scroll_position = float(self.lyric_index)
+        self.lyric_image_key = None
+        self.update()
+
+    def animate_lyric(self, value):
+        self.scroll_position = float(value)
+        self.update()
+
+    def set_lyric_time(self, position, playing, jump=False):
+        if self.lyrics is None:
+            return
+        index = self.lyrics.index_at(position)
+        if jump or not playing or abs(index - self.lyric_index) > 1:
+            self.lyric_animation.stop()
+            self.lyric_index = index
+            if self.scroll_position != float(index):
+                self.scroll_position = float(index); self.update()
+        elif index != self.lyric_index:
+            self.lyric_animation.stop()
+            self.lyric_index = index
+            self.lyric_animation.setStartValue(self.scroll_position)
+            self.lyric_animation.setEndValue(float(index))
+            self.lyric_animation.start()
 
     def initializeGL(self):
         try:
@@ -422,7 +461,14 @@ class GlassView(QOpenGLWidget):
         program.release(); self.vao.release()
         if measure:
             self.query.end(); self.gpu_pending = True
-        if self.show_text:
+        if self.show_text and self.lyrics is not None:
+            key = (id(self.lyrics), self.scroll_position, self.width(), self.height(), self.devicePixelRatioF(), self.dark_text)
+            if key != self.lyric_image_key:
+                self.lyric_image = lyric_layer(self.lyrics, self.scroll_position, self.width(), self.height(),
+                                               self.devicePixelRatioF(), self.dark_text)
+                self.lyric_image_key = key
+            painter = QPainter(self); painter.drawImage(0, 0, self.lyric_image); painter.end()
+        elif self.show_text:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             font = QFont("Microsoft YaHei UI", 20)
@@ -444,6 +490,7 @@ class GlassView(QOpenGLWidget):
 
     def shutdown(self):
         self.transparency_animation.stop()
+        self.lyric_animation.stop()
         if not self.ready:
             return
         self.makeCurrent()
@@ -551,12 +598,17 @@ class Controls(QWidget):
         self.sliders = {}
         self.playback = PlaybackSnapshot()
         self.media_reader = None
+        self.lyrics_worker = None
+        self.lyric_request = 0
+        self.lyric_key = None
+        self.last_lyric_position = 0.
+        self.closing = False
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
         self.setMinimumWidth(470)
         layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 20); layout.setSpacing(12)
         title = QLabel("MoonLyrics · 月光歌词"); title.setStyleSheet("font-size: 20px; font-weight: 500;")
         layout.addWidget(title)
-        help_text = QLabel("打开 Windows 版 Apple Music 播放歌曲，悬浮条会显示歌曲与进度。\n按住悬浮条可拖动；歌词搜索与同步滚动将在后续接入。")
+        help_text = QLabel("播放 Apple Music，歌词会在玻璃框内居中滚动、上下渐隐。\n按住悬浮条可拖动；锁定后允许鼠标穿透。")
         help_text.setWordWrap(True); layout.addWidget(help_text)
         self.track_title = QLabel("等待 Apple Music")
         self.track_title.setWordWrap(True)
@@ -575,6 +627,19 @@ class Controls(QWidget):
         self.media_progress.setTextVisible(False); self.media_progress.setFixedHeight(6)
         self.media_progress.setValue(0); self.media_progress.setAccessibleName("Apple Music 播放进度")
         layout.addWidget(self.media_progress)
+        lyric_row = QHBoxLayout()
+        lyric_row.addWidget(QLabel("曲目地区")); self.storefront = QComboBox()
+        for code, label in (("tr", "土耳其"), ("cn", "中国大陆"), ("hk", "香港"), ("tw", "台湾"), ("us", "美国")):
+            self.storefront.addItem(label, code)
+        self.storefront.setCurrentIndex(self.storefront.findData(settings["storefront"]))
+        self.storefront.setToolTip("仅用于跨地区曲名匹配，不会修改 Apple Music 账号地区。")
+        self.storefront.currentIndexChanged.connect(self.storefront_changed)
+        lyric_row.addWidget(self.storefront); lyric_row.addStretch()
+        self.retry_lyrics = QPushButton("重新匹配"); self.retry_lyrics.setEnabled(False)
+        self.retry_lyrics.clicked.connect(lambda: self.request_lyrics(force=True))
+        lyric_row.addWidget(self.retry_lyrics); layout.addLayout(lyric_row)
+        self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
+        self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
         layout.addWidget(QLabel("玻璃风格"))
         preset_row = QHBoxLayout()
         self.preset_group = QButtonGroup(self)
@@ -626,7 +691,7 @@ class Controls(QWidget):
         self.stats = QLabel("正在测量 CPU、内存与实际帧率…"); self.stats.setWordWrap(True); layout.addWidget(self.stats)
         self.timing = QLabel(); self.timing.setWordWrap(True); layout.addWidget(self.timing)
         self.hardware = QLabel("正在识别显卡…"); self.hardware.setWordWrap(True); layout.addWidget(self.hardware)
-        footer = QLabel("桌面画面仅在本机处理，不保存、不上传。\nCPU 为整机归一化占比；GPU 显示本材质绘制耗时，并非 GPU 占用百分比。")
+        footer = QLabel("桌面画面仅在本机处理，不保存、不上传。\n歌词匹配会向曲目和歌词服务查询歌名、歌手与时长。\nCPU 为整机归一化占比；GPU 显示材质绘制耗时。")
         footer.setWordWrap(True); footer.setStyleSheet("color: #66778a; font-size: 12px;"); layout.addWidget(footer)
         self.status = QLabel("拖动后方的网页或播放视频，可检验真实背景取样。")
         self.status.setWordWrap(True); layout.addWidget(self.status)
@@ -638,16 +703,52 @@ class Controls(QWidget):
         self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
         self.media_timer.start(100)
         if media:
+            self.lyrics_worker = LyricsWorker(self)
+            self.lyrics_worker.result_ready.connect(self.accept_lyrics)
+            self.lyrics_worker.start()
             self.media_reader = AppleMusicReader(self)
             self.media_reader.snapshot_changed.connect(self.set_playback)
             self.media_reader.start()
 
     def set_playback(self, snapshot):
+        if self.closing:
+            return
         self.playback = snapshot
         self.track_title.setText(snapshot.title or "等待 Apple Music")
         self.track_details.setText(" · ".join(value for value in (snapshot.artist, snapshot.album) if value)
                                    or "打开 Apple Music 并播放一首歌曲")
         self.media_status.setToolTip(snapshot.message)
+        key = (snapshot.source, snapshot.title, snapshot.artist, snapshot.album, round(snapshot.duration), self.settings["storefront"])
+        if key != self.lyric_key:
+            self.request_lyrics()
+        self.update_playback_display()
+
+    def storefront_changed(self):
+        self.settings["storefront"] = self.storefront.currentData()
+        self.request_lyrics(force=True)
+
+    def request_lyrics(self, force=False):
+        if self.closing:
+            return
+        snapshot = self.playback
+        self.lyric_key = (snapshot.source, snapshot.title, snapshot.artist, snapshot.album, round(snapshot.duration), self.settings["storefront"])
+        self.lyric_request += 1
+        self.glass.view.set_lyrics(None)
+        valid = bool(snapshot.title and snapshot.artist and snapshot.duration > 0)
+        self.retry_lyrics.setEnabled(valid and self.lyrics_worker is not None)
+        self.lyrics_status.setToolTip("")
+        self.lyrics_status.setText("正在匹配歌词…" if valid else "等待完整的歌曲信息")
+        track = Track(snapshot.title, snapshot.artist, snapshot.album, snapshot.duration) if valid else None
+        if self.lyrics_worker is not None:
+            self.lyrics_worker.request(self.lyric_request, track, self.settings["storefront"], force)
+
+    def accept_lyrics(self, request_id, document, message):
+        if self.closing or request_id != self.lyric_request:
+            return
+        self.lyrics_status.setText(message)
+        self.glass.view.set_lyrics(document, self.playback.position_at())
+        if document is not None:
+            self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {document.source}")
         self.update_playback_display()
 
     def update_playback_display(self):
@@ -657,8 +758,10 @@ class Controls(QWidget):
         timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
         self.media_status.setText(state); self.media_time.setText(timing)
         self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
+        self.glass.view.set_lyric_time(position, snapshot.status == "playing", abs(position - self.last_lyric_position) > 1.5)
+        self.last_lyric_position = position
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
-        secondary = timing + " · " + state if snapshot.title else "播放音乐后显示歌曲与进度"
+        secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else "播放音乐后显示歌曲与进度"
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
             self.glass.view.primary_text, self.glass.view.secondary_text = primary, secondary
             self.glass.view.update()
@@ -703,12 +806,14 @@ class Controls(QWidget):
         self.hardware.setText("显卡：" + view.renderer)
 
     def closeEvent(self, event):
-        if self.media_reader is not None:
-            self.media_reader.stop()
-            if not self.media_reader.wait(1500):
-                event.ignore()
-                QTimer.singleShot(100, self.close)
-                return
+        self.closing = True
+        readers = [reader for reader in (self.media_reader, self.lyrics_worker) if reader is not None]
+        for reader in readers:
+            reader.stop()
+        if any(not reader.wait(100) for reader in readers):
+            self.lyrics_status.setText("正在结束后台请求…")
+            event.ignore(); QTimer.singleShot(100, self.close)
+            return
         self.media_timer.stop()
         self.sample_timer.stop()
         self.glass.close()
@@ -908,6 +1013,38 @@ def self_test(app, control, report_path, preview_path):
         assert control.media_progress.value() == round(64 / 270 * 1000)
         assert "月光轻轻落在窗台" in glass.view.primary_text
         result["playback_display"] = True
+        assert normalize("遠走高飛") == normalize("远走高飞")
+        control.media_timer.stop()
+        document = Lyrics((LyricLine(60., "上面一行轻轻隐去"), LyricLine(64., "中间一行清晰显示"),
+                           LyricLine(68., "下面一行渐渐出现"), LyricLine(72., "下一句等待时光")), "测试")
+        control.lyric_request = 8
+        control.accept_lyrics(7, document, "旧请求")
+        assert glass.view.lyrics is None, "An old song replaced the current lyrics"
+        control.accept_lyrics(8, document, "已匹配 · 测试")
+        assert glass.view.lyric_index == 1
+        glass.view.set_lyric_time(68.1, True)
+        # Advance deterministically: desktop capture can delay the GUI event loop.
+        glass.view.lyric_animation.setCurrentTime(100)
+        assert 1 < glass.view.scroll_position < 2, "Lyric movement is not animated"
+        QTest.qWait(300)
+        assert glass.view.scroll_position == 2.
+        glass.view.set_lyric_time(60.1, True, jump=True)
+        assert glass.view.scroll_position == 0., "Seek did not reset the visible lyric"
+        glass.view.set_lyric_time(64.1, False)
+        assert glass.view.scroll_position == 1.
+        layer = lyric_layer(document, 1., glass.width(), glass.height(), glass.devicePixelRatioF(), False)
+        rgba = layer.convertToFormat(QImage.Format.Format_RGBA8888)
+        alpha = Image.frombytes("RGBA", (rgba.width(), rgba.height()), rgba.bits().asstring(rgba.sizeInBytes())).getchannel("A")
+        assert alpha.getextrema()[1] > 200
+        assert max(alpha.crop((0, 0, alpha.width, 1)).getdata()) <= 4
+        assert max(alpha.crop((0, alpha.height - 1, alpha.width, alpha.height)).getdata()) <= 4
+        assert alpha.getpixel((0, 0)) == alpha.getpixel((alpha.width - 1, 0)) == 0
+        areas = [ImageStat.Stat(alpha.crop((0, round(alpha.height * a), alpha.width, round(alpha.height * b)))).mean[0]
+                 for a, b in ((0., .28), (.34, .66), (.72, 1.))]
+        assert areas[1] > max(areas[0], areas[2]) * 1.5, areas
+        result["lyrics_viewport"] = dict(clipped=True, edge_fade=True, center_emphasis=True,
+                                         animated_scroll=True, seek_and_pause=True, stale_result_rejected=True)
+        glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
         result["ok"] = True
@@ -929,6 +1066,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--media-probe", action="store_true")
+    parser.add_argument("--lyrics-probe", nargs=3, metavar=("TITLE", "ARTIST", "SECONDS"))
     parser.add_argument("--report", type=Path)
     parser.add_argument("--preview", type=Path)
     args = parser.parse_args()
@@ -949,6 +1087,8 @@ def main():
     app.setStyle("Fusion"); app.setFont(QFont("Microsoft YaHei UI", 10))
     if args.media_probe:
         return media_probe(app, args.report)
+    if args.lyrics_probe:
+        return lyrics_probe(args.lyrics_probe, args.report)
     settings = dict(DEFAULTS)
     if not args.self_test:
         for directory in (APP_DIR, LEGACY_DIR):

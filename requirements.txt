@@ -1,4 +1,6 @@
 PyQt6==6.11.0
+requests==2.34.2
+opencc-python-reimplemented==0.1.7
 winrt-Windows.Media.Control==3.2.1; sys_platform == 'win32'
 winrt-Windows.Foundation==3.2.1; sys_platform == 'win32'
 winrt-Windows.Foundation.Collections==3.2.1; sys_platform == 'win32'

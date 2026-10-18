@@ -7,7 +7,7 @@ PRESETS = {
     "rich": dict(label="凝润", description="细腻的浓磨砂，让繁杂背景更安静。", blur=38, refraction=2),
 }
 DEFAULTS = dict(preset="soft", blur=PRESETS["soft"]["blur"], refraction=PRESETS["soft"]["refraction"],
-                transparency_level=1, width=583, height=80, fps=30)
+                transparency_level=1, width=583, height=80, fps=30, storefront="tr")
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240))
 
 
@@ -25,6 +25,8 @@ def normalized(values):
             result["transparency_level"] = round(1 + (max(90, min(100, previous)) - 90) * .9)
     if values.get("fps") in (15, 30, 60):
         result["fps"] = int(values["fps"])
+    if values.get("storefront") in ("tr", "cn", "hk", "tw", "us"):
+        result["storefront"] = values["storefront"]
     preset = values.get("preset")
     if isinstance(preset, str) and preset in PRESETS:
         result["preset"] = preset
