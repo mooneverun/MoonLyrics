@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import sys
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                             QSizeGrip, QVBoxLayout, QWidget)
@@ -68,7 +68,7 @@ class TitleBar(QWidget):
             heading.addWidget(label)
         row.addLayout(heading)
         row.addStretch()
-        for text, label, callback in (("−", "最小化", window.showMinimized),
+        for text, label, callback in (("−", "收起到托盘", window.minimize_settings),
                                       ("□", "最大化或还原", self.toggle_maximized),
                                       ("×", "关闭", window.close)):
             button = QPushButton(text)
@@ -96,6 +96,11 @@ class SettingsWindow(QWidget):
         super().__init__()
         self.material = MATERIALS["soft"]
         self.backdrop_active = False
+        self.transparency_level = 1.
+        self.transparency_animation = QVariantAnimation(self)
+        self.transparency_animation.setDuration(240)
+        self.transparency_animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self.transparency_animation.valueChanged.connect(self.animate_transparency)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowIcon(application_icon())
@@ -197,10 +202,27 @@ class SettingsWindow(QWidget):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
             QToolTip { color: #eaf2ff; background: #293950; border: 1px solid #65768e; padding: 6px; }
+            QMenu { color: #e7effa; background: #293950; border: 1px solid #65768e; border-radius: 8px; padding: 6px; }
+            QMenu::item { padding: 7px 24px 7px 12px; border-radius: 5px; }
+            QMenu::item:selected { background: #405b7c; }
+            QMenu::separator { height: 1px; background: #52627a; margin: 4px 6px; }
         """.replace("PANEL_ALPHA", str(panel))
                .replace("CHEVRON_PATH", (ASSETS / "settings-chevron.svg").as_posix())
                .replace("CHECK_PATH", (ASSETS / "settings-check.svg").as_posix()))
         self.update()
+
+    def set_transparency(self, level):
+        self.transparency_animation.stop()
+        self.transparency_animation.setStartValue(self.transparency_level)
+        self.transparency_animation.setEndValue(float(max(1, min(10, level))))
+        self.transparency_animation.start()
+
+    def animate_transparency(self, level):
+        self.transparency_level = float(level)
+        self.update()
+
+    def minimize_settings(self):
+        self.showMinimized()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -215,12 +237,19 @@ class SettingsWindow(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = QColor(*self.material)
-        if not self.backdrop_active:
+        if self.backdrop_active:
+            color.setAlpha(round(self.material[3] * (1 - .85 * (self.transparency_level - 1) / 9)))
+        else:
             color.setAlpha(255)
         painter.setBrush(color)
         painter.setPen(QPen(QColor(216,234,255,52), 1))
         rect = self.rect().toRectF().adjusted(.5, .5, -.5, -.5)
-        painter.drawRoundedRect(rect, 0 if self.isMaximized() else 18, 0 if self.isMaximized() else 18)
+        # DWM clips both surfaces at one native corner. A second Qt round cutout
+        # exposes the untinted Acrylic as grey wedges between the two radii.
+        if self.backdrop_active or self.isMaximized():
+            painter.drawRect(rect)
+        else:
+            painter.drawRoundedRect(rect, 18, 18)
 
     def mousePressEvent(self, event):
         edges = Qt.Edge(0)

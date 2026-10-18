@@ -12,15 +12,15 @@ import struct
 import sys
 import time
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QSurfaceFormat, QVector2D, QVector4D
 from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLShader, QOpenGLShaderProgram,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QGridLayout,
-                            QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
-                            QSlider, QVBoxLayout, QWidget)
+                            QHBoxLayout, QLabel, QMenu, QMessageBox, QProgressBar, QPushButton,
+                            QSlider, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, normalized, transparency_amount, lyric_offset_seconds
 from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
@@ -686,6 +686,7 @@ class Controls(SettingsWindow):
                 readout.setText(f"{number}{' px' if field in ('width', 'height') else ' / 10'}")
                 if field == "transparency_level":
                     self.glass.view.set_transparency(number)
+                    self.set_transparency(number)
                 else:
                     self.glass.resize(self.settings["width"], self.settings["height"])
                 self.glass.refresh()
@@ -693,7 +694,7 @@ class Controls(SettingsWindow):
             self.sliders[key] = slider
             grid.addWidget(caption, row, 0); grid.addWidget(slider, row, 1); grid.addWidget(value, row, 2)
         layout.addLayout(grid)
-        self.sliders["transparency_level"].setToolTip("1 保留更多磨砂，10 完全透明；切换时柔和过渡。")
+        self.sliders["transparency_level"].setToolTip("同步调节歌词条和设置面板：1 更浓，10 更通透，切换时柔和过渡。\n设置面板保留系统磨砂，文字与按钮不会一起变淡。")
         row = QHBoxLayout()
         row.addWidget(QLabel("刷新上限")); self.fps = QComboBox()
         for value in (15, 30, 60): self.fps.addItem(f"{value} FPS", value)
@@ -719,6 +720,15 @@ class Controls(SettingsWindow):
         self.apply_material(settings["preset"])
         self.resize(min(610, screen.width() - 60), min(980, screen.height() - 80))
         self.move(screen.left() + 40, max(screen.top() + 20, screen.bottom() - self.height() - 30))
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("MoonLyrics · 月光歌词")
+        self.tray_menu = QMenu(self)
+        self.tray_menu.addAction("打开设置", self.restore_settings)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("退出 MoonLyrics", self.close)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
         self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
         self.media_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.media_timer.start(33)
@@ -729,6 +739,26 @@ class Controls(SettingsWindow):
             self.media_reader = AppleMusicReader(self)
             self.media_reader.snapshot_changed.connect(self.set_playback)
             self.media_reader.start()
+
+    def minimize_settings(self):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide()
+        else:
+            super().minimize_settings()
+
+    def restore_settings(self):
+        if not self.closing:
+            self.showNormal(); self.raise_(); self.activateWindow()
+
+    def tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.restore_settings()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange and self.isMinimized()
+                and getattr(self, "tray", None) and QSystemTrayIcon.isSystemTrayAvailable()):
+            QTimer.singleShot(0, self.hide)
 
     def set_playback(self, snapshot):
         if self.closing:
@@ -876,6 +906,7 @@ class Controls(SettingsWindow):
             return
         self.media_timer.stop()
         self.sample_timer.stop()
+        self.tray.hide()
         self.glass.close()
         if self.save_enabled:
             try:
@@ -884,6 +915,7 @@ class Controls(SettingsWindow):
             except OSError:
                 LOG.exception("Settings save failed")
         super().closeEvent(event)
+        QApplication.instance().quit()
 
 
 def self_test(app, control, report_path, preview_path):
@@ -1158,9 +1190,38 @@ def self_test(app, control, report_path, preview_path):
             control.preset_buttons[name].click(); QTest.qWait(100)
             assert control.property("glassPreset") == name and control.material == MATERIALS[name]
             assert control.settings["preset"] == name and control.preset_buttons[name].isChecked()
+            if control.backdrop_active:
+                frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
+                for x, y in ((5, 5), (control.width()-6, 5), (5, control.height()-6),
+                             (control.width()-6, control.height()-6)):
+                    assert frame.pixelColor(round(x*ratio), round(y*ratio)).alpha() >= MATERIALS[name][3] - 3, "Native corners expose untinted Acrylic"
             if preview_path:
                 control.grab().save(str(preview_path.with_name(f"settings-{name}.png")))
         control.set_preset("soft")
+        control.sliders["transparency_level"].setValue(10); QTest.qWait(80)
+        assert 1 < control.transparency_level < 10
+        QTest.qWait(230)
+        assert control.transparency_level == control.settings["transparency_level"] == 10
+        assert abs(glass.view.transparency - 1) < .0001 and control.windowOpacity() == 1
+        if control.backdrop_active:
+            frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
+            assert frame.pixelColor(round(15*ratio), round(200*ratio)).alpha() < MATERIALS["soft"][3] // 2
+        control.sliders["transparency_level"].setValue(1); QTest.qWait(280)
+        tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        if tray_available:
+            assert control.tray.isVisible()
+            control.minimize_settings(); QTest.qWait(50)
+            assert not control.isVisible() and glass.isVisible()
+            control.tray_activated(QSystemTrayIcon.ActivationReason.Trigger); QTest.qWait(100)
+            assert control.isVisible() and not control.isMinimized()
+            control.showMinimized(); QTest.qWait(100)
+            assert not control.isVisible() and control.tray.isVisible()
+            control.tray_menu.actions()[0].trigger(); QTest.qWait(100)
+            assert control.isVisible() and not control.isMinimized()
+        with patch("moonlyrics.windows.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+            control.minimize_settings(); QTest.qWait(100)
+            assert control.isVisible() and control.isMinimized()
+        control.restore_settings(); QTest.qWait(100)
         with patch("moonlyrics.settings_ui.native_backdrop", return_value=False):
             control.update_backdrop(); QTest.qWait(50)
             fallback = control.grab().toImage()
@@ -1174,7 +1235,8 @@ def self_test(app, control, report_path, preview_path):
         assert control.status.isVisibleTo(control.scroll)
         scroll.setValue(0)
         result["settings_ui"] = dict(preset_sync=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
-                                      native_backdrop=control.backdrop_active)
+                                      native_backdrop=control.backdrop_active, native_corner_tint=True,
+                                      shared_transparency=True, tray_minimize_restore=tray_available, taskbar_fallback=True)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
@@ -1182,11 +1244,16 @@ def self_test(app, control, report_path, preview_path):
         if preview_path:
             glass.view.grabFramebuffer().save(str(preview_path))
             control.grab().save(str(preview_path.with_name("glass-controls.png")))
+        if tray_available:
+            control.minimize_settings()  # Exercise shutdown while settings are hidden.
     except Exception as exc:
         LOG.exception("Self-test failed")
         result.update(ok=False, error=str(exc))
     finally:
         calibration.close(); control.close()
+    if result.get("ok"):
+        assert not control.tray.isVisible() and not glass.isVisible()
+        result["settings_ui"]["tray_exit"] = True
     if report_path:
         report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=True), flush=True)
