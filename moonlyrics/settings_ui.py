@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollAr
 
 LOG = logging.getLogger("moonlyrics")
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
-MATERIALS = {"clear": (20, 30, 47, 155), "soft": (26, 37, 55, 195), "rich": (32, 44, 63, 230)}
+MATERIALS = {"rich": (32, 44, 63, 230)}
 
 
 def application_icon():
@@ -94,7 +94,7 @@ class TitleBar(QWidget):
 class SettingsWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.material = MATERIALS["soft"]
+        self.material = MATERIALS["rich"]
         self.backdrop_active = False
         self.transparency_level = 1.
         self.transparency_animation = QVariantAnimation(self)
@@ -161,11 +161,10 @@ class SettingsWindow(QWidget):
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#192b43"))
         self.setPalette(palette)
         # Cards retain contrast even when the system reduces backdrop transparency.
-        panel = {"clear": 9, "soft": 14, "rich": 21}[preset]
         self.setStyleSheet("""
             QWidget { color: #e7effa; }
             QWidget#settingsContent, QWidget#settingsViewport, QScrollArea#settingsScroll { background: transparent; border: none; }
-            QFrame#settingsCard { background: rgba(255,255,255,PANEL_ALPHA); border: 1px solid rgba(222,237,255,24); border-radius: 16px; }
+            QFrame#settingsCard { background: rgba(255,255,255,21); border: 1px solid rgba(222,237,255,24); border-radius: 16px; }
             QLabel { background: transparent; border: none; }
             QLabel#appTitle { font-size: 19px; font-weight: 600; }
             QLabel#caption, QLabel#secondary { color: #a9bad0; font-size: 11px; }
@@ -178,8 +177,6 @@ class SettingsWindow(QWidget):
             QPushButton:pressed { background: rgba(191,218,255,55); }
             QPushButton:focus, QComboBox:focus { border-color: #bcd9ff; }
             QPushButton:disabled { color: #8c9bae; background: rgba(255,255,255,5); }
-            QPushButton[glassChoice="true"] { padding: 10px 14px; }
-            QPushButton:checked { background: #bfdcff; border-color: #d5e8ff; color: #1c304b; font-weight: 600; }
             QPushButton#windowButton, QPushButton#closeWindow { padding: 0; min-height: 0; border: none; background: transparent; font-size: 18px; }
             QPushButton#windowButton:hover { background: rgba(255,255,255,20); }
             QPushButton#closeWindow:hover { background: #a84655; }
@@ -206,8 +203,7 @@ class SettingsWindow(QWidget):
             QMenu::item { padding: 7px 24px 7px 12px; border-radius: 5px; }
             QMenu::item:selected { background: #405b7c; }
             QMenu::separator { height: 1px; background: #52627a; margin: 4px 6px; }
-        """.replace("PANEL_ALPHA", str(panel))
-               .replace("CHEVRON_PATH", (ASSETS / "settings-chevron.svg").as_posix())
+        """.replace("CHEVRON_PATH", (ASSETS / "settings-chevron.svg").as_posix())
                .replace("CHECK_PATH", (ASSETS / "settings-check.svg").as_posix()))
         self.update()
 

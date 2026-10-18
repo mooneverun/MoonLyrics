@@ -19,13 +19,15 @@ class StyleTests(unittest.TestCase):
             settings["lyric_offset_ms"] = DEFAULTS["lyric_offset_ms"]
             self.assertEqual(style_settings.lyric_offset_seconds(settings), 1)
 
-    def test_accepted_presets(self):
-        self.assertEqual(set(PRESETS), {"clear", "soft", "rich"})
-        for name, preset in PRESETS.items():
-            result = normalized(dict(preset=name, blur=100, refraction=100, width=640))
-            self.assertEqual(result["blur"], preset["blur"])
-            self.assertEqual(result["refraction"], preset["refraction"])
+    def test_fixed_rich_material_migrates_legacy_styles_and_preserves_controls(self):
+        self.assertEqual(set(PRESETS), {"rich"})
+        for previous in ("clear", "soft", "rich", "unknown", [], None):
+            result = normalized(dict(preset=previous, blur=100, refraction=100, width=640, transparency_level=7))
+            self.assertEqual(result["preset"], "rich")
+            self.assertEqual(result["blur"], PRESETS["rich"]["blur"])
+            self.assertEqual(result["refraction"], PRESETS["rich"]["refraction"])
             self.assertEqual(result["width"], 640)
+            self.assertEqual(result["transparency_level"], 7)
             self.assertEqual(normalized(json.loads(json.dumps(result))), result)
 
     def test_transparency_mapping_and_legacy_settings(self):

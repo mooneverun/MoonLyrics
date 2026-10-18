@@ -18,7 +18,7 @@ from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLShader, QOpenGLShaderProgram,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QGridLayout,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGridLayout,
                             QHBoxLayout, QLabel, QMenu, QMessageBox, QProgressBar, QPushButton,
                             QSlider, QSystemTrayIcon, QVBoxLayout, QWidget)
 
@@ -655,24 +655,9 @@ class Controls(SettingsWindow):
         for widget in (earlier, later, reset_timing): timing_row.addWidget(widget)
         layout.addLayout(timing_row)
         layout = self.section("玻璃外观")
-        preset_row = QHBoxLayout()
-        self.preset_group = QButtonGroup(self)
-        self.preset_group.setExclusive(True)
-        self.preset_buttons = {}
-        for key, preset in PRESETS.items():
-            button = QPushButton(preset["label"])
-            button.setCheckable(True); button.setChecked(key == settings["preset"])
-            button.setAccessibleName(preset["label"] + "玻璃风格")
-            button.setToolTip(preset["description"])
-            button.setProperty("glassChoice", True)
-            button.clicked.connect(lambda checked, name=key: self.set_preset(name))
-            self.preset_group.addButton(button)
-            self.preset_buttons[key] = button
-            preset_row.addWidget(button)
-        layout.addLayout(preset_row)
-        self.preset_description = QLabel(PRESETS[settings["preset"]]["description"])
-        self.preset_description.setObjectName("secondary")
-        self.preset_description.setWordWrap(True); layout.addWidget(self.preset_description)
+        description = QLabel(PRESETS["rich"]["description"])
+        description.setObjectName("secondary")
+        description.setWordWrap(True); layout.addWidget(description)
         grid = QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(14)
         labels = dict(transparency_level="背景透明度", width="玻璃条宽度", height="玻璃条高度")
         for row, (key, label) in enumerate(labels.items()):
@@ -704,7 +689,7 @@ class Controls(SettingsWindow):
         layout.addLayout(row)
         self.lock = QCheckBox("锁定悬浮条，允许鼠标穿透（在这里解锁）")
         self.lock.toggled.connect(self.glass.set_locked); layout.addWidget(self.lock)
-        help_text = QLabel("按住歌词条可拖动；锁定后鼠标可穿透。设置界面跟随玻璃风格。")
+        help_text = QLabel("按住歌词条可拖动；锁定后鼠标可穿透。透明度同时作用于歌词条和设置面板。")
         help_text.setObjectName("secondary"); help_text.setWordWrap(True); layout.addWidget(help_text)
         layout = self.section("运行状态")
         self.stats = QLabel("正在测量 CPU、内存与实际帧率…"); self.stats.setWordWrap(True); layout.addWidget(self.stats)
@@ -853,14 +838,6 @@ class Controls(SettingsWindow):
             self.glass.view.primary_text, self.glass.view.secondary_text = primary, secondary
             self.glass.view.update()
 
-    def set_preset(self, name):
-        preset = PRESETS[name]
-        self.settings.update(preset=name, blur=preset["blur"], refraction=preset["refraction"])
-        self.preset_buttons[name].setChecked(True)
-        self.preset_description.setText(preset["description"])
-        self.apply_material(name)
-        self.glass.refresh()
-
     def fps_changed(self):
         self.settings["fps"] = self.fps.currentData()
         if not self.glass.paused:
@@ -950,7 +927,9 @@ def self_test(app, control, report_path, preview_path):
     def parameters(**values):
         for key, number in values.items():
             if key == "fps": control.fps.setCurrentIndex((15, 30, 60).index(number))
-            elif key == "preset": control.preset_buttons[number].click()
+            elif key == "preset":
+                material = PRESETS[number]
+                control.settings.update(preset=number, blur=material["blur"], refraction=material["refraction"])
             elif key in ("blur", "refraction"): control.settings[key] = number
             else: control.sliders[key].setValue(number)
         control.glass.refresh(); QTest.qWait(300)
@@ -1020,30 +999,16 @@ def self_test(app, control, report_path, preview_path):
         result["refraction_mean_pixel_difference"] = sum(ImageStat.Stat(ImageChops.difference(sharp, refracted)).mean) / 3
         assert result["blur_edge_energy_ratio"] < .35, result
         assert result["refraction_mean_pixel_difference"] > .5, result
-        preset_images = []
-        for name, preset in PRESETS.items():
-            before = {key: control.settings[key] for key in ("width", "height", "transparency_level")}
-            parameters(preset=name)
-            assert control.settings["blur"] == preset["blur"] and control.settings["refraction"] == preset["refraction"]
-            assert sum(button.isChecked() for button in control.preset_buttons.values()) == 1
-            assert all(control.settings[key] == value for key, value in before.items())
-            preset_images.append(image())
-        result["preset_pixel_differences"] = [sum(ImageStat.Stat(ImageChops.difference(a, b)).mean) / 3
-                                               for a, b in zip(preset_images, preset_images[1:])]
-        assert all(value > .5 for value in result["preset_pixel_differences"]), result
-        if preview_path:
-            comparison = Image.new("RGB", (preset_images[0].width, sum(im.height for im in preset_images)))
-            offset = 0
-            for im in preset_images:
-                comparison.paste(im, (0, offset)); offset += im.height
-            comparison.save(preview_path.with_name("glass-presets.png"))
+        parameters(preset="rich")
+        assert control.settings["blur"] == 38 and control.settings["refraction"] == 2
+        result["fixed_rich_material"] = True
         # Fine stripes expose sparse-kernel aliasing and nearest-filter blocks that a coarse checker misses.
         result["frost_stripe_checks"] = []
         for direction in ("vertical", "horizontal"):
             calibration.pattern = direction
             for period in (2, 3, 4, 6, 8):
                 calibration.period = period; calibration.update(); QTest.qWait(50)
-                for name in ("soft", "rich"):
+                for name in PRESETS:
                     parameters(preset=name)
                     actual = image()
                     cw, ch = glass.capture.size
@@ -1089,7 +1054,7 @@ def self_test(app, control, report_path, preview_path):
         result["transparent_background_alpha"] = 0
         glass.view.show_text = True
         result["profiles"] = {}
-        for name, values in (("soft_30fps", dict(preset="soft", transparency_level=1, fps=30)),
+        for name, values in (("rich_30fps", dict(preset="rich", transparency_level=1, fps=30)),
                              ("maximum_60fps", dict(blur=100, refraction=100, transparency_level=1, fps=60))):
             parameters(**values); glass.timer.start(round(1000 / values["fps"]))
             QTest.qWait(1200); control.samples.clear()
@@ -1097,7 +1062,7 @@ def self_test(app, control, report_path, preview_path):
             samples = list(control.samples)
             result["profiles"][name] = {key: statistics.mean(s[key] for s in samples if s[key] is not None)
                                         for key in samples[0] if any(s[key] is not None for s in samples)}
-        parameters(preset="soft", transparency_level=1, width=583, height=80, fps=30)
+        parameters(preset="rich", transparency_level=1, width=583, height=80, fps=30)
         control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
                                              album="播放信息测试", status="paused", position=64., duration=270.))
         assert control.media_time.text() == "1:04 / 4:30"
@@ -1186,18 +1151,13 @@ def self_test(app, control, report_path, preview_path):
         QTest.qWait(100); assert control.isMaximized()
         QTest.mouseDClick(control.title_bar, Qt.MouseButton.LeftButton, pos=QPoint(250, 25))
         QTest.qWait(100); assert not control.isMaximized()
-        for name in PRESETS:
-            control.preset_buttons[name].click(); QTest.qWait(100)
-            assert control.property("glassPreset") == name and control.material == MATERIALS[name]
-            assert control.settings["preset"] == name and control.preset_buttons[name].isChecked()
-            if control.backdrop_active:
-                frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
-                for x, y in ((5, 5), (control.width()-6, 5), (5, control.height()-6),
-                             (control.width()-6, control.height()-6)):
-                    assert frame.pixelColor(round(x*ratio), round(y*ratio)).alpha() >= MATERIALS[name][3] - 3, "Native corners expose untinted Acrylic"
-            if preview_path:
-                control.grab().save(str(preview_path.with_name(f"settings-{name}.png")))
-        control.set_preset("soft")
+        assert control.settings["preset"] == "rich" and control.material == MATERIALS["rich"]
+        assert not any(button.text() in ("清透", "柔光", "凝润") for button in control.findChildren(QPushButton))
+        if control.backdrop_active:
+            frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
+            for x, y in ((5, 5), (control.width()-6, 5), (5, control.height()-6),
+                         (control.width()-6, control.height()-6)):
+                assert frame.pixelColor(round(x*ratio), round(y*ratio)).alpha() >= MATERIALS["rich"][3] - 3, "Native corners expose untinted Acrylic"
         control.sliders["transparency_level"].setValue(10); QTest.qWait(80)
         assert 1 < control.transparency_level < 10
         QTest.qWait(230)
@@ -1205,7 +1165,7 @@ def self_test(app, control, report_path, preview_path):
         assert abs(glass.view.transparency - 1) < .0001 and control.windowOpacity() == 1
         if control.backdrop_active:
             frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
-            assert frame.pixelColor(round(15*ratio), round(200*ratio)).alpha() < MATERIALS["soft"][3] // 2
+            assert frame.pixelColor(round(15*ratio), round(200*ratio)).alpha() < MATERIALS["rich"][3] // 2
         control.sliders["transparency_level"].setValue(1); QTest.qWait(280)
         tray_available = QSystemTrayIcon.isSystemTrayAvailable()
         if tray_available:
@@ -1227,14 +1187,14 @@ def self_test(app, control, report_path, preview_path):
             fallback = control.grab().toImage()
             ratio = fallback.devicePixelRatio()
             pixel = fallback.pixelColor(round(15 * ratio), round(200 * ratio))
-            assert pixel.alpha() == 255 and pixel.getRgb()[:3] == MATERIALS["soft"][:3], pixel.getRgb()
+            assert pixel.alpha() == 255 and pixel.getRgb()[:3] == MATERIALS["rich"][:3], pixel.getRgb()
         control.update_backdrop()
         scroll = control.scroll.verticalScrollBar()
         scroll.setValue(scroll.maximum()); QTest.qWait(100)
         assert scroll.value() == scroll.maximum()
         assert control.status.isVisibleTo(control.scroll)
         scroll.setValue(0)
-        result["settings_ui"] = dict(preset_sync=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
+        result["settings_ui"] = dict(fixed_material=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
                                       native_backdrop=control.backdrop_active, native_corner_tint=True,
                                       shared_transparency=True, tray_minimize_restore=tray_available, taskbar_fallback=True)
         glass.view.update(); QTest.qWait(100)

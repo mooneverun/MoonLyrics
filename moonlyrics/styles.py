@@ -1,13 +1,11 @@
-"""Platform-independent glass presets and settings."""
+"""Platform-independent glass material and settings."""
 import math
 
 PRESETS = {
-    "clear": dict(label="清透", description="轻柔透镜感，保留更多背景细节。", blur=7, refraction=26),
-    "soft": dict(label="柔光", description="均匀的轻磨砂，保留柔和的明暗层次。", blur=20, refraction=4),
     "rich": dict(label="凝润", description="细腻的浓磨砂，让繁杂背景更安静。", blur=38, refraction=2),
 }
 LYRIC_SOURCES = {"kugou": "酷狗", "lrclib": "LRCLIB", "netease": "网易云", "qq": "QQ音乐"}
-DEFAULTS = dict(preset="soft", blur=PRESETS["soft"]["blur"], refraction=PRESETS["soft"]["refraction"],
+DEFAULTS = dict(preset="rich", blur=PRESETS["rich"]["blur"], refraction=PRESETS["rich"]["refraction"],
                 transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=1000, lyric_timing_version=1,
                 lyric_source_order=tuple(LYRIC_SOURCES))
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
@@ -40,9 +38,7 @@ def normalized(values):
     if values.get("storefront") in ("tr", "cn", "hk", "tw", "us"):
         result["storefront"] = values["storefront"]
     result["lyric_source_order"] = normalized_source_order(values.get("lyric_source_order"))
-    preset = values.get("preset")
-    if isinstance(preset, str) and preset in PRESETS:
-        result["preset"] = preset
+    # Old selectable styles migrate to the single approved rich material.
     for key in ("blur", "refraction"):
         result[key] = PRESETS[result["preset"]][key]
     return result
