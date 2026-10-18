@@ -12,6 +12,154 @@ from moonlyrics.styles import LYRIC_SOURCES
 LRC = "[00:01.20]月光落下\n[00:04.50]窗前等候"
 
 
+class ArtistIdentityTests(TestCase):
+    def setUp(self):
+        self.finder = LyricsFinder()
+        self.finder.cancelled = lambda: False
+        self.finder.deadline = time.monotonic() + 20
+        self.finder.reachable = False
+        self.addCleanup(self.finder.close)
+        self.aliases = [Track("Moonlight (feat. Star Guest)", "Lead Name", "Album", 100),
+                        Track("달빛 (feat. 달게스트)", "한국리드", "Album", 100)]
+
+    def song(self, artists=None):
+        return dict(id=21, name="달빛", artists=artists or [dict(id=11, name="Lead Name"), dict(id=12, name="合作歌手")],
+                    album=dict(name="Album"), duration=100000)
+
+    def profile(self, identifier=12, name="合作歌手", **fields):
+        return dict(code=200, artist=dict(id=identifier, name=name, trans="달게스트", transNames=["달게스트"], alias=[], **fields))
+
+    def test_netease_uses_guest_profile_and_mixes_verified_recording_languages(self):
+        song = self.song()
+        def response(url, **params):
+            if url.endswith("/12"):
+                return self.profile()
+            if "search/get" in url:
+                return dict(code=200, result=dict(songs=[song]))
+            if "song/lyric" in url:
+                return dict(code=200, lrc=dict(lyric=LRC))
+            raise AssertionError("Unnecessary or unexpected profile request")
+        self.finder._json = Mock(side_effect=response)
+        document = self.finder._netease(self.aliases)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.source, "网易云音乐")
+        self.assertEqual(sum(call.args[0].endswith("/12") for call in self.finder._json.call_args_list), 1)
+
+    def test_qq_uses_matching_artist_mid_and_structured_foreign_name(self):
+        song = dict(mid="songmid", name="달빛", singer=[dict(mid="leadmid", name="Lead Name"),
+            dict(mid="guestmid", name="合作歌手")], album=dict(name="Album"), interval=100)
+        def response(url, **params):
+            if "musicu.fcg" in url:
+                request = params["body"]["req"]
+                if request["method"] == "GetSingerDetail":
+                    self.assertEqual(request["param"]["singer_mids"], ["guestmid"])
+                    return dict(code=0, req=dict(code=0, data=dict(singer_list=[dict(
+                        basic_info=dict(singer_mid="guestmid", name="合作歌手 (달게스트)"),
+                        ex_info=dict(foreign_name="달게스트", desc="irrelevant text"))])))
+                return dict(code=0, req=dict(code=0, data=dict(body=dict(song=dict(list=[song])))))
+            return dict(code=0, lyric=LRC)
+        self.finder._json = Mock(side_effect=response)
+        document = self.finder._qq(self.aliases)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.source, "QQ音乐")
+
+    def test_wrong_profile_identity_or_name_is_not_used_as_an_alias(self):
+        for invalid in (self.profile(identifier=99), self.profile(name="另一位歌手"),
+                        dict(code=200, artist=None), dict(code=200, artist=dict(id=True, name="合作歌手", trans="달게스트"))):
+            self.finder._json = Mock(return_value=invalid)
+            self.assertIsNone(self.finder._artist_profile("netease", dict(id=12, name="合作歌手")))
+
+    def test_positive_profiles_are_cached_and_failed_lookups_can_recover(self):
+        self.finder._json = Mock(side_effect=[requests.ConnectionError("temporary"), self.profile()])
+        record = dict(id=12, name="合作歌手")
+        self.assertIsNone(self.finder._artist_profile("netease", record))
+        names = self.finder._artist_profile("netease", record)
+        self.assertTrue(names)
+        self.assertEqual(self.finder._artist_profile("netease", record), names)
+        self.assertEqual(self.finder._json.call_count, 2)
+
+    def test_missing_or_extra_people_and_distinct_ids_with_the_same_name_are_rejected(self):
+        for artists in ([dict(id=12, name="合作歌手")],
+                        [dict(id=11, name="Lead Name"), dict(id=12, name="合作歌手"), dict(id=13, name="Extra")],
+                        [dict(id=11, name="Lead Name"), dict(id=12, name="Lead Name")]):
+            self.finder._json = Mock(return_value=dict(code=200, result=dict(songs=[self.song(artists)])))
+            self.assertIsNone(self.finder._netease(self.aliases))
+            self.assertTrue(all("search/get" in call.args[0] for call in self.finder._json.call_args_list))
+
+    def test_wrong_versions_and_durations_do_not_trigger_artist_requests(self):
+        for title, duration in (("달빛 (Live)", 100000), ("달빛", 115000)):
+            song = self.song(); song.update(name=title, duration=duration)
+            self.finder._json = Mock(return_value=dict(code=200, result=dict(songs=[song])))
+            self.assertIsNone(self.finder._netease(self.aliases))
+            self.assertTrue(all("search/get" in call.args[0] for call in self.finder._json.call_args_list))
+
+    def test_cached_identity_still_obeys_cancellation(self):
+        self.finder._json = Mock(return_value=self.profile())
+        record = dict(id=12, name="合作歌手")
+        self.finder._artist_profile("netease", record)
+        self.finder.cancelled = lambda: True
+        with self.assertRaises(SearchCancelled):
+            self.finder._artist_profile("netease", record)
+
+    def test_wrong_qq_mid_or_numeric_id_does_not_supply_aliases(self):
+        record = dict(id=12, mid="guestmid", name="合作歌手")
+        for basic in (dict(singer_mid="anothermid", singer_id=12, name="合作歌手"),
+                      dict(singer_mid="guestmid", singer_id=99, name="合作歌手"),
+                      dict(singer_mid="guestmid", singer_id=True, name="合作歌手")):
+            self.finder._json = Mock(return_value=dict(code=0, req=dict(code=0, data=dict(singer_list=[dict(
+                basic_info=basic, ex_info=dict(foreign_name="달게스트"))]))))
+            self.assertIsNone(self.finder._artist_profile("qq", record))
+
+    def test_profile_cache_follows_the_artist_across_songs_and_is_source_scoped(self):
+        self.finder._json = Mock(return_value=self.profile())
+        self.finder._artist_profile("netease", dict(id=12, name="合作歌手"))
+        for title in ("Moonlight", "Another Song"):
+            aliases = [Track(title + " (feat. 달게스트)", "Lead Name", duration=100)]
+            candidate = Track(title, "Lead Name & 合作歌手", duration=100)
+            matches = [( (False, 0), 21, candidate, self.song()["artists"] )]
+            self.assertEqual(len(list(self.finder._source_matches("netease", matches, aliases))), 1)
+        self.finder._json.assert_called_once()
+        self.finder._json = Mock(return_value=dict(code=0, req=dict(code=0, data=dict(singer_list=[dict(
+            basic_info=dict(singer_mid="12", name="合作歌手"), ex_info=dict(foreign_name="Other Person"))]))))
+        names = self.finder._artist_profile("qq", dict(mid="12", name="合作歌手"))
+        self.assertNotEqual(names, self.finder.artist_cache[("netease", 12)])
+        self.finder._json.assert_called_once()
+
+    def test_duplicate_source_id_cannot_be_counted_as_two_performers(self):
+        aliases = [Track("Moonlight (feat. Guest)", "Lead", duration=100)]
+        candidate = Track("Moonlight", "Lead & Guest", duration=100)
+        records = [dict(id=11, name="Lead"), dict(id=11, name="Guest")]
+        self.finder._json = Mock()
+        self.assertEqual(list(self.finder._source_matches("netease", [((False, 0), 21, candidate, records)], aliases)), [])
+        self.finder._json.assert_not_called()
+
+    def test_profile_requests_are_bounded_without_blocking_the_next_search(self):
+        self.finder._json = Mock(side_effect=requests.ConnectionError("temporary"))
+        for identifier in range(1, 10):
+            self.finder._artist_profile("netease", dict(id=identifier, name="合作歌手"))
+        self.assertEqual(self.finder._json.call_count, 6)
+        with self.assertRaises(SearchCancelled):
+            self.finder.find(Track("Moonlight", "Lead"), cancelled=lambda: True)
+        self.assertEqual(self.finder.profile_requests, 0)
+
+    def test_later_slow_profile_is_not_requested_before_a_valid_lyric_download(self):
+        first = self.song([dict(id=11, name="Lead Name"), dict(id=12, name="달게스트")])
+        second = self.song(); second["id"] = 22
+        self.finder._json = Mock(side_effect=[dict(code=200, result=dict(songs=[first, second])),
+                                             dict(code=200, lrc=dict(lyric=LRC))])
+        self.assertIsNotNone(self.finder._netease(self.aliases))
+        self.assertEqual(self.finder._json.call_count, 2)
+
+    def test_unverified_candidates_do_not_crowd_out_a_known_performer(self):
+        wrong = [self.song([dict(id=100 + index, name="Unknown"), dict(id=12, name="合作歌手")]) for index in range(8)]
+        known = self.song([dict(id=11, name="Lead Name"), dict(id=12, name="달게스트")]); known["id"] = 99
+        self.finder._json = Mock(side_effect=[dict(code=200, result=dict(songs=wrong + [known])),
+                                             dict(code=200, lrc=dict(lyric=LRC))])
+        self.assertIsNotNone(self.finder._netease(self.aliases))
+        self.assertEqual(self.finder._json.call_args.kwargs["id"], 99)
+        self.assertEqual(self.finder._json.call_count, 2)
+
+
 class SourcePriorityTests(TestCase):
     def setUp(self):
         self.finder = LyricsFinder()
@@ -82,6 +230,11 @@ class RegionalMatchingTests(TestCase):
     def test_korean_names_are_not_guessed_without_a_verified_alias(self):
         candidate = Track(self.aliases[0].title, "루나", "Album", 200)
         self.assertIsNone(match_rank(candidate, self.aliases[:1]))
+
+    def test_locale_with_missing_guest_does_not_weaken_the_original_roster(self):
+        incomplete = [self.aliases[0], Track("달빛", "루나", "Album", 200)]
+        self.assertIsNone(match_rank(Track("달빛", "루나", "Album", 200), incomplete))
+        self.assertIsNotNone(match_rank(Track("달빛", "루나 & Guest A & Guest B", "Album", 200), incomplete))
 
 
 class AnonymousSourceTests(TestCase):

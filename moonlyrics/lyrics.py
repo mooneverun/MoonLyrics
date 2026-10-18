@@ -3,6 +3,7 @@ import base64
 from bisect import bisect_right
 from dataclasses import dataclass
 import html
+from itertools import islice
 import logging
 import re
 import time
@@ -53,8 +54,8 @@ def bilingual_parts(text):
     match = re.fullmatch(r"(.+?)\s*[\[(]([^\[\]()]+)[\])]", unicodedata.normalize("NFKC", text).strip())
     if match:
         left, right = match[1].strip(), match[2].strip()
-        asian = lambda value: has_chinese(value) or has_korean(value)
-        if (asian(left) != asian(right) and re.search(r"[A-Za-z]", right if asian(left) else left)
+        script = lambda value: (has_chinese(value), has_korean(value), bool(re.search(r"[A-Za-z]", value)))
+        if (script(left) != script(right) and any(script(left)) and any(script(right))
                 and normalize(right) not in ("live", "remix", "cover", "instrumental", "karaoke")):
             return left, right
     return ()
@@ -71,7 +72,11 @@ def artist_parts(value):
 
 
 def same_artists(left, right):
-    left_parts, remaining = artist_parts(left), artist_parts(right)
+    return same_artist_groups(artist_parts(left), artist_parts(right))
+
+
+def same_artist_groups(left_parts, right_parts):
+    remaining = list(right_parts)
     if not left_parts or len(left_parts) != len(remaining) or len(left_parts) > 16:
         return False
     for part in left_parts:
@@ -80,6 +85,20 @@ def same_artists(left, right):
             return False
         remaining.pop(matches[0])
     return True
+
+
+def recording_rosters(aliases):
+    """Verified recording locales may translate the lead and guest blocks independently."""
+    if not aliases:
+        return []
+    count = len(artist_parts(aliases[0].artist + " & " + split_credit(aliases[0].title)[1]))
+    rosters = []
+    for lead in aliases:
+        for guest in aliases:
+            parts = artist_parts(lead.artist + " & " + split_credit(guest.title)[1])
+            if 0 < len(parts) == count <= 16 and parts not in rosters:
+                rosters.append(parts)
+    return rosters
 
 
 @dataclass(frozen=True)
@@ -157,27 +176,33 @@ def parse_lrc(text):
     return lines if any(line.text for line in lines) else ()
 
 
-def match_rank(candidate, aliases, tolerance=5):
-    """Title AND artist must agree; duration rejects different recordings."""
+def metadata_rank(candidate, aliases, tolerance=5):
+    """Prequalify the recording before spending requests on performer identities."""
     ranks = []
     if not candidate.title or not candidate.artist:
         return None
-    title, guests = split_credit(candidate.title)
+    title = split_credit(candidate.title)[0]
     known_titles = {title_name(split_credit(alias.title)[0]) for alias in aliases}
     if title_name(title) not in known_titles:
         bilingual = bilingual_parts(title)
         if not bilingual or not all(title_name(part) in known_titles for part in bilingual):
             return None
     for expected in aliases:
-        expected_guests = split_credit(expected.title)[1]
-        if not same_artists(" & ".join(filter(None, (candidate.artist, guests))),
-                            " & ".join(filter(None, (expected.artist, expected_guests)))):
-            continue
         difference = abs(candidate.duration - expected.duration)
         if expected.duration > 0 and (candidate.duration <= 0 or difference > tolerance):
             continue
         ranks.append((normalize(candidate.album) != normalize(expected.album), difference))
     return min(ranks) if ranks else None
+
+
+def match_rank(candidate, aliases, tolerance=5):
+    """Title AND the complete performer roster must agree; duration rejects versions."""
+    rank = metadata_rank(candidate, aliases, tolerance)
+    if rank is not None:
+        parts = artist_parts(candidate.artist + " & " + split_credit(candidate.title)[1])
+        if any(same_artist_groups(parts, roster) for roster in recording_rosters(aliases)):
+            return rank
+    return None
 
 
 class SearchCancelled(Exception):
@@ -194,6 +219,8 @@ class LyricsFinder:
         self.session.headers["User-Agent"] = "MoonLyrics/0.1 (https://github.com/mooneverun/MoonLyrics)"
         self.cache = {}
         self.alias_cache = {}
+        self.artist_cache = {}
+        self.profile_requests = 0
         self.stage_deadline = None
         self.failures = set()
 
@@ -431,6 +458,112 @@ class LyricsFinder:
         return list(dict.fromkeys(_simplified.convert(f"{track.artist} {split_credit(track.title)[0]}").strip()
                                   for track in aliases))[:3]
 
+    @staticmethod
+    def _artist_id(provider, record):
+        identifier = record.get("id" if provider == "netease" else "mid")
+        if provider == "netease":
+            return identifier if type(identifier) is int and 0 < identifier < 10 ** 15 else None
+        return identifier if isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", identifier) else None
+
+    def _artist_profile(self, provider, record):
+        self._check()
+        identifier = self._artist_id(provider, record)
+        if identifier is None:
+            return None
+        key = provider, identifier
+        anchor = {normalize(name) for name in (record["name"], *bilingual_parts(record["name"]))}
+        if key in self.artist_cache:
+            names = self.artist_cache[key]
+            return names if names & anchor else None
+        if self.profile_requests >= 6:
+            self.failures.add("Artist profile budget")
+            return None
+        self.profile_requests += 1
+        try:
+            if provider == "netease":
+                data = self._json(f"https://music.163.com/api/artist/{identifier}", headers={"Referer": "https://music.163.com/"})
+                artist = data.get("artist") if isinstance(data, dict) and data.get("code") == 200 else None
+                if not isinstance(artist, dict) or type(artist.get("id")) is not int or artist["id"] != identifier:
+                    raise ValueError("Artist identity mismatch")
+                values = [artist.get("name"), artist.get("trans")]
+                for field in ("alias", "transNames"):
+                    extra = artist.get(field, [])
+                    if not isinstance(extra, list) or len(extra) > 32:
+                        raise ValueError("Invalid artist aliases")
+                    values.extend(extra)
+            else:
+                body = dict(comm=dict(ct="19", cv="1859", uin="0"), req=dict(method="GetSingerDetail",
+                    module="music.musichallSinger.SingerInfoInter", param=dict(singer_mids=[identifier],
+                    ex_singer=1, wiki_singer=1, group_singer=0, pic=0, photos=0)))
+                data = self._json("https://u.y.qq.com/cgi-bin/musicu.fcg", headers={"Referer": "https://y.qq.com/"}, body=body)
+                request = data.get("req") if isinstance(data, dict) and data.get("code") == 0 else None
+                details = request.get("data") if isinstance(request, dict) and request.get("code") == 0 else None
+                singers = details.get("singer_list") if isinstance(details, dict) else None
+                if not isinstance(singers, list) or len(singers) != 1 or not isinstance(singers[0], dict):
+                    raise ValueError("Invalid artist profile")
+                artist, extra = singers[0].get("basic_info"), singers[0].get("ex_info", {})
+                if not isinstance(artist, dict) or artist.get("singer_mid") != identifier or not isinstance(extra, dict):
+                    raise ValueError("Artist identity mismatch")
+                if record.get("id") is not None and (type(record["id"]) is not int
+                        or type(artist.get("singer_id")) is not int or artist["singer_id"] != record["id"]):
+                    raise ValueError("Artist numeric identity mismatch")
+                values = [artist.get("name"), extra.get("foreign_name")]
+            if not isinstance(artist.get("name"), str) or not artist["name"].strip():
+                raise ValueError("Missing artist name")
+            names = set()
+            for value in values:
+                if value is None or value == "":
+                    continue
+                if not isinstance(value, str) or len(value) > 128:
+                    raise ValueError("Invalid artist name")
+                names.update(normalize(name) for name in (value, *bilingual_parts(value)) if normalize(name))
+            if not names & anchor:
+                raise ValueError("Artist name does not anchor to the search result")
+            if len(self.artist_cache) >= 256:
+                self.artist_cache.pop(next(iter(self.artist_cache)))
+            self.artist_cache[key] = frozenset(names)
+            LOG.info("Artist aliases verified: provider=%s artist_id=%s names=%s", provider, identifier, len(names))
+            return self.artist_cache[key]
+        except (requests.RequestException, ValueError, TypeError, KeyError) as error:
+            self.failures.add(provider + " artist profile")
+            LOG.info("Artist profile unavailable: provider=%s error=%s", provider, type(error).__name__)
+            return None
+
+    def _source_matches(self, provider, matches, aliases):
+        rosters = recording_rosters(aliases)
+        known = set().union(*(part for roster in rosters for part in roster))
+        # Verify and download lazily: a slow later profile must not discard an earlier valid song.
+        ordered = sorted(matches, key=lambda item: (match_rank(item[2], aliases) is None, item[0]))
+        for rank, identifier, candidate, records in ordered[:6]:
+            self._check()
+            groups, identities = [], []
+            for record in records:
+                identity = self._artist_id(provider, record)
+                names = {normalize(name) for name in (record["name"], *bilingual_parts(record["name"])) if normalize(name)}
+                if identity is not None and identity in identities:
+                    groups[identities.index(identity)].update(names)
+                else:
+                    identities.append(identity)
+                    groups.append(names)
+            if any(left & right for index, left in enumerate(groups) for right in groups[index + 1:]):
+                continue
+            if len(identities) == len(records) and match_rank(candidate, aliases) is not None:
+                yield rank, identifier, candidate
+                continue
+            guests = artist_parts(split_credit(candidate.title)[1])
+            groups.extend(part for part in guests if not any(part & names for names in groups))
+            if not rosters or len(groups) != len(rosters[0]) or len(groups) > 16:
+                continue
+            for index, identity in enumerate(identities):
+                if groups[index] & known or identity is None:
+                    continue
+                record = next(record for record in records if self._artist_id(provider, record) == identity)
+                names = self._artist_profile(provider, record)
+                if names:
+                    groups[index].update(names)
+            if any(same_artist_groups(groups, roster) for roster in rosters):
+                yield rank, identifier, candidate
+
     def _netease(self, aliases, tolerance=5):
         headers = {"Referer": "https://music.163.com/"}
         for query in self._search_queries(aliases):
@@ -457,12 +590,12 @@ class LyricsFinder:
                         continue
                     candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
                                       finite(item.get("duration")) / 1000)
-                    rank = match_rank(candidate, aliases, tolerance)
+                    rank = metadata_rank(candidate, aliases, tolerance)
                     identifier = item.get("id")
                     if rank is not None and type(identifier) is int and 0 < identifier < 10 ** 15:
-                        matches.append((rank, identifier, candidate))
-                LOG.info("Lyric search: provider=NetEase candidates=%s accepted=%s", len(songs), len(matches))
-                for _, identifier, candidate in sorted(matches, key=lambda item: item[0])[:2]:
+                        matches.append((rank, identifier, candidate, item["artists"]))
+                LOG.info("Lyric search: provider=NetEase candidates=%s recordings=%s", len(songs), len(matches))
+                for _, identifier, candidate in islice(self._source_matches("netease", matches, aliases), 2):
                     try:
                         payload = self._json("https://music.163.com/api/song/lyric", headers=headers,
                                              id=identifier, lv=-1, kv=-1, tv=-1)
@@ -510,12 +643,12 @@ class LyricsFinder:
                         continue
                     candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
                                       finite(item.get("interval")))
-                    rank = match_rank(candidate, aliases, tolerance)
+                    rank = metadata_rank(candidate, aliases, tolerance)
                     mid = item.get("mid")
                     if rank is not None and isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", mid):
-                        matches.append((rank, mid, candidate))
-                LOG.info("Lyric search: provider=QQMusic candidates=%s accepted=%s", len(songs), len(matches))
-                for _, mid, candidate in sorted(matches, key=lambda item: item[0])[:2]:
+                        matches.append((rank, mid, candidate, item["singer"]))
+                LOG.info("Lyric search: provider=QQMusic candidates=%s recordings=%s", len(songs), len(matches))
+                for _, mid, candidate in islice(self._source_matches("qq", matches, aliases), 2):
                     try:
                         payload = self._json("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", headers=headers,
                                              songmid=mid, format="json", nobase64=1)
@@ -543,6 +676,7 @@ class LyricsFinder:
     def find(self, track, storefront="tr", cancelled=lambda: False, force=False, source_order=None):
         self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
         self.failures = set()
+        self.profile_requests = 0
         self._check()
         order = normalized_source_order(source_order)
         key = track, storefront, order
