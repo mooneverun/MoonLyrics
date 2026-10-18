@@ -1,5 +1,7 @@
 # MoonLyrics · 月光歌词
 
+首个公开版本：[v0.1.0](https://github.com/mooneverun/MoonLyrics/releases/tag/v0.1.0)。下载 Release 附件中的 `MoonLyrics.exe` 即可运行，版本号记录在 `VERSION`。
+
 以柔和、通透的玻璃材质呈现桌面悬浮歌词。
 
 当前版本是 **Windows 同步歌词测试版**：保留已经实际试用确认的玻璃效果，跟随 Windows 版 Apple Music 自动匹配歌词，在玻璃框内居中滚动、上下渐隐。
