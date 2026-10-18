@@ -584,6 +584,10 @@ class Controls(QWidget):
         self.lyrics_worker = None
         self.lyric_request = 0
         self.lyric_key = None
+        self.lyric_duration = 0.
+        self.lyric_debounce = QTimer(self)
+        self.lyric_debounce.setSingleShot(True)
+        self.lyric_debounce.timeout.connect(self.request_lyrics)
         self.closing = False
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
         self.setMinimumWidth(470)
@@ -714,29 +718,42 @@ class Controls(QWidget):
         self.track_details.setText(" · ".join(value for value in (snapshot.artist, snapshot.album) if value)
                                    or "打开 Apple Music 并播放一首歌曲")
         self.media_status.setToolTip(snapshot.message)
-        key = (snapshot.source, snapshot.title, snapshot.artist, snapshot.album, round(snapshot.duration), self.settings["storefront"])
-        if key != self.lyric_key:
-            self.request_lyrics()
+        if (self.matching_key(snapshot) != self.lyric_key
+                or snapshot.duration > 0 and abs(snapshot.duration - self.lyric_duration) > 1.):
+            self.request_lyrics(defer=True)
         self.update_playback_display()
 
     def storefront_changed(self):
         self.settings["storefront"] = self.storefront.currentData()
         self.request_lyrics(force=True)
 
-    def request_lyrics(self, force=False):
+    def matching_key(self, snapshot):
+        text = lambda value: " ".join(value.split()).casefold()
+        identity = (snapshot.source, text(snapshot.title), text(snapshot.artist), text(snapshot.album), self.settings["storefront"])
+        duration = snapshot.duration
+        if duration <= 0 and self.lyric_key and self.lyric_key[:5] == identity:
+            duration = self.lyric_duration
+        ready = bool(snapshot.title and snapshot.artist and duration > 0 and snapshot.status != "changing")
+        return (*identity, ready)
+
+    def request_lyrics(self, force=False, defer=False):
         if self.closing:
             return
+        self.lyric_debounce.stop()
         snapshot = self.playback
-        self.lyric_key = (snapshot.source, snapshot.title, snapshot.artist, snapshot.album, round(snapshot.duration), self.settings["storefront"])
+        self.lyric_key = self.matching_key(snapshot)
+        self.lyric_duration = snapshot.duration if snapshot.duration > 0 else (self.lyric_duration if self.lyric_key[-1] else 0.)
         self.lyric_request += 1
         self.glass.view.set_lyrics(None)
-        valid = bool(snapshot.title and snapshot.artist and snapshot.duration > 0)
+        valid = self.lyric_key[-1]
         self.retry_lyrics.setEnabled(valid and self.lyrics_worker is not None)
         self.lyrics_status.setToolTip("")
-        self.lyrics_status.setText("正在匹配歌词…" if valid else "等待完整的歌曲信息")
-        track = Track(snapshot.title, snapshot.artist, snapshot.album, snapshot.duration) if valid else None
+        self.lyrics_status.setText(("等待歌曲信息稳定…" if defer else "正在匹配歌词…") if valid else "等待完整的歌曲信息")
+        track = Track(snapshot.title, snapshot.artist, snapshot.album, self.lyric_duration) if valid else None
         if self.lyrics_worker is not None:
-            self.lyrics_worker.request(self.lyric_request, track, self.settings["storefront"], force)
+            self.lyrics_worker.request(self.lyric_request, None if defer else track, self.settings["storefront"], force)
+        if defer and valid:
+            self.lyric_debounce.start(600)
 
     def accept_lyrics(self, request_id, document, message):
         if self.closing or request_id != self.lyric_request:
@@ -812,6 +829,7 @@ class Controls(QWidget):
 
     def closeEvent(self, event):
         self.closing = True
+        self.lyric_debounce.stop()
         readers = [reader for reader in (self.media_reader, self.lyrics_worker) if reader is not None]
         for reader in readers:
             reader.stop()
@@ -1020,6 +1038,7 @@ def self_test(app, control, report_path, preview_path):
         result["playback_display"] = True
         assert normalize("遠走高飛") == normalize("远走高飞")
         control.media_timer.stop()
+        control.lyric_debounce.stop()
         document = Lyrics((LyricLine(60., "上面一行轻轻隐去"), LyricLine(64., "中间一行清晰显示"),
                            LyricLine(68., "下面一行渐渐出现"), LyricLine(72., "下一句等待时光")), "测试")
         control.lyric_request = 8

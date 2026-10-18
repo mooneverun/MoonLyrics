@@ -34,6 +34,14 @@ def has_chinese(text):
     return any("\u3400" <= char <= "\u9fff" for char in text)
 
 
+def same_artists(left, right):
+    split = lambda value: sorted(normalize(part) for part in re.split(
+        r"\s*(?:[,&、，;；]|\b(?:feat(?:uring)?|ft)\.?\s+)\s*",
+        unicodedata.normalize("NFKC", value), flags=re.I) if normalize(part))
+    left_parts, right_parts = split(left), split(right)
+    return bool(left_parts) and left_parts == right_parts
+
+
 @dataclass(frozen=True)
 class Track:
     title: str
@@ -117,7 +125,7 @@ def match_rank(candidate, aliases, tolerance=5):
     for expected in aliases:
         if title_name(candidate.title) != title_name(expected.title):
             continue
-        if normalize(candidate.artist) != normalize(expected.artist):
+        if not same_artists(candidate.artist, expected.artist):
             continue
         difference = abs(candidate.duration - expected.duration)
         if expected.duration > 0 and (candidate.duration <= 0 or difference > tolerance):
@@ -130,12 +138,18 @@ class SearchCancelled(Exception):
     pass
 
 
+class StageExpired(Exception):
+    pass
+
+
 class LyricsFinder:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "MoonLyrics/0.1 (https://github.com/mooneverun/MoonLyrics)"
         self.cache = {}
         self.alias_cache = {}
+        self.stage_deadline = None
+        self.failures = set()
 
     def close(self):
         self.session.close()
@@ -143,19 +157,44 @@ class LyricsFinder:
     def _check(self):
         if self.cancelled():
             raise SearchCancelled()
-        if time.monotonic() > self.deadline:
+        now = time.monotonic()
+        if now >= self.deadline:
             raise TimeoutError("歌词匹配超时，可以重新尝试")
+        if self.stage_deadline is not None and now >= self.stage_deadline:
+            raise StageExpired()
+
+    def _run_stage(self, operation, *args, budget=4., **kwargs):
+        previous = self.stage_deadline
+        self.stage_deadline = min(self.deadline, time.monotonic() + budget)
+        try:
+            self._check()
+            result = operation(*args, **kwargs)
+            self._check()
+            return result
+        except StageExpired:
+            name = getattr(operation, "__name__", type(operation).__name__)
+            self.failures.add(name)
+            LOG.info("Lyric stage timed out: stage=%s; continuing with other sources", name)
+            return None
+        finally:
+            self.stage_deadline = previous
 
     def _json(self, url, **params):
         self._check()
         response = None
         try:
-            response = self.session.get(url, params=params, timeout=(2, 4))
+            remaining = min(self.deadline, self.stage_deadline or self.deadline) - time.monotonic()
+            if remaining <= .1:
+                if self.deadline - time.monotonic() <= .1:
+                    raise TimeoutError("歌词匹配超时，可以重新尝试")
+                raise StageExpired()
+            response = self.session.get(url, params=params, timeout=(min(1.5, remaining * .35), min(3., remaining * .65)))
             response.raise_for_status()
             if len(response.content) > 3_000_000:
                 raise ValueError("Lyrics response is too large")
             data = response.json()
         except (requests.RequestException, ValueError) as exc:
+            self.failures.add(url)
             LOG.info("Lyric request failed: endpoint=%s status=%s error=%s",
                      url, getattr(response, "status_code", None), type(exc).__name__)
             raise
@@ -179,27 +218,39 @@ class LyricsFinder:
         try:
             payload = self._json("https://itunes.apple.com/search", term=f"{track.title} {track.artist}",
                                  country=storefront, entity="song", limit=25)
+            if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                self.failures.add("Apple")
+                return aliases
             matches = [(match_rank(candidate, [track]), identifier, candidate)
                        for identifier, candidate in self._apple_tracks(payload)]
             matches = [item for item in matches if item[0] is not None and item[1]]
             if matches:
                 _, identifier, original = min(matches, key=lambda item: item[0])
                 for country in ("hk", "tw"):
-                    localized = self._json("https://itunes.apple.com/lookup", id=identifier, country=country, entity="song")
-                    for found_id, candidate in self._apple_tracks(localized):
-                        if found_id != identifier or abs(candidate.duration - original.duration) > 1:
+                    try:
+                        localized = self._json("https://itunes.apple.com/lookup", id=identifier, country=country, entity="song")
+                        if not isinstance(localized, dict) or not isinstance(localized.get("results"), list):
+                            self.failures.add("Apple localized names")
                             continue
-                        if not any(normalize(candidate.title) == normalize(alias.title)
-                                   and normalize(candidate.artist) == normalize(alias.artist) for alias in aliases):
-                            aliases.append(candidate)
+                        for found_id, candidate in self._apple_tracks(localized):
+                            if found_id != identifier or abs(candidate.duration - original.duration) > 1:
+                                continue
+                            if not any(normalize(candidate.title) == normalize(alias.title)
+                                       and normalize(candidate.artist) == normalize(alias.artist) for alias in aliases):
+                                aliases.append(candidate)
+                    except (requests.RequestException, ValueError, TypeError, KeyError) as error:
+                        self.failures.add("Apple localized names")
+                        LOG.info("Localized name lookup failed: country=%s error=%s", country, type(error).__name__)
                     if any(has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
         except (requests.RequestException, ValueError, TypeError, KeyError):
             LOG.debug("Apple localized name lookup unavailable", exc_info=True)
         self._check()
-        if len(self.alias_cache) >= 64:
-            self.alias_cache.pop(next(iter(self.alias_cache)))
-        self.alias_cache[key] = aliases
+        # An unavailable or empty lookup must not become a sticky negative cache.
+        if len(aliases) > 1:
+            if len(self.alias_cache) >= 64:
+                self.alias_cache.pop(next(iter(self.alias_cache)))
+            self.alias_cache[key] = aliases
         return aliases
 
     def _catalog_aliases(self, aliases):
@@ -210,9 +261,11 @@ class LyricsFinder:
                 data = self._json("https://songsearch.kugou.com/song_search_v2",
                                   keyword=_simplified.convert(artist), page=1, pagesize=30)
                 if not isinstance(data, dict) or data.get("status") != 1 or not isinstance(data.get("data"), dict):
+                    self.failures.add("catalog")
                     continue
                 records = data["data"].get("lists")
                 if not isinstance(records, list):
+                    self.failures.add("catalog")
                     continue
                 candidates = {}
                 for item in records[:30]:
@@ -251,11 +304,13 @@ class LyricsFinder:
                 data = self._json("https://lyrics.kugou.com/search", ver=1, man="yes", client="pc", keyword=query,
                                   duration=round(aliases[0].duration * 1000))
                 if not isinstance(data, dict) or data.get("status") != 200:
+                    self.failures.add("KuGou")
                     continue
                 self.reachable = True
                 matches = []
                 candidates = data.get("candidates")
                 if not isinstance(candidates, list):
+                    self.failures.add("KuGou")
                     continue
                 for item in candidates[:50]:
                     if not isinstance(item, dict):
@@ -267,29 +322,38 @@ class LyricsFinder:
                         matches.append((rank, item, candidate))
                 LOG.info("Lyric search: provider=KuGou candidates=%s accepted=%s", len(candidates), len(matches))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0])[:2]:
-                    payload = self._json("https://lyrics.kugou.com/download", ver=1, client="pc", id=item["id"],
-                                         accesskey=item["accesskey"], fmt="lrc", charset="utf8")
-                    if not isinstance(payload, dict):
-                        continue
-                    raw = base64.b64decode(payload.get("content", ""), validate=True).decode("utf-8-sig")
-                    lines = parse_lrc(raw)
-                    if lines:
-                        return Lyrics(lines, "酷狗", candidate.title, candidate.artist)
+                    try:
+                        payload = self._json("https://lyrics.kugou.com/download", ver=1, client="pc", id=item["id"],
+                                             accesskey=item["accesskey"], fmt="lrc", charset="utf8")
+                        if not isinstance(payload, dict):
+                            self.failures.add("KuGou download")
+                            continue
+                        raw = base64.b64decode(payload.get("content", ""), validate=True).decode("utf-8-sig")
+                        lines = parse_lrc(raw)
+                        if lines:
+                            return Lyrics(lines, "酷狗", candidate.title, candidate.artist)
+                    except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError) as error:
+                        self.failures.add("KuGou download")
+                        LOG.info("Lyric candidate download failed: provider=KuGou error=%s", type(error).__name__)
             except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError):
                 LOG.debug("KuGou lyrics unavailable", exc_info=True)
         return None
 
     def _lrclib(self, aliases, tolerance=5):
-        titles = []
+        queries = []
         for track in reversed(aliases):
-            titles.extend((track.title, _simplified.convert(track.title), _traditional.convert(track.title)))
-        for title in list(dict.fromkeys(titles))[:3]:
+            for title in (track.title, _simplified.convert(track.title), _traditional.convert(track.title)):
+                if not has_chinese(title):
+                    queries.append((title, track.artist))
+                queries.append((title, None))
+        for title, artist in list(dict.fromkeys(queries))[:4]:
             try:
                 params = dict(track_name=title)
-                if not has_chinese(title):
-                    params["artist_name"] = aliases[0].artist
+                if artist is not None:
+                    params["artist_name"] = artist
                 data = self._json("https://lrclib.net/api/search", **params)
                 if not isinstance(data, list):
+                    self.failures.add("LRCLIB")
                     continue
                 self.reachable = True
                 matches = []
@@ -312,6 +376,8 @@ class LyricsFinder:
 
     def find(self, track, storefront="tr", cancelled=lambda: False, force=False):
         self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
+        self.failures = set()
+        self._check()
         key = track, storefront
         if not force and key in self.cache:
             cached = self.cache[key]
@@ -323,21 +389,23 @@ class LyricsFinder:
             self._check()
             base_aliases = [track]
             aliases = base_aliases
+            localized = False
             mixed = has_chinese(track.title + track.artist + track.album) and not (
                 has_chinese(track.title) and has_chinese(track.artist))
             if mixed:
-                aliases = self._aliases(track, storefront)
+                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
+                localized = True
             chinese = any(has_chinese(item.title + item.artist) for item in aliases)
             providers = (self._kugou, self._lrclib) if chinese else (self._lrclib, self._kugou)
-            result = next((found for provider in providers if (found := provider(aliases))), None)
-            if result is None and aliases == base_aliases:
-                aliases = self._aliases(track, storefront)
+            result = next((found for provider in providers if (found := self._run_stage(provider, aliases))), None)
+            if result is None and not localized:
+                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
                 if aliases != base_aliases:
-                    result = self._kugou(aliases) or self._lrclib(aliases)
+                    result = self._run_stage(self._kugou, aliases) or self._run_stage(self._lrclib, aliases)
             if result is None:
-                expanded = self._catalog_aliases(aliases)
+                expanded = self._run_stage(self._catalog_aliases, aliases, budget=3.) or aliases
                 if expanded != aliases:
-                    result = self._kugou(expanded, tolerance=2) or self._lrclib(expanded, tolerance=2)
+                    result = self._run_stage(self._kugou, expanded, tolerance=2) or self._run_stage(self._lrclib, expanded, tolerance=2)
                     if result is not None:
                         self.alias_cache[key] = expanded
             self._check()
@@ -346,6 +414,8 @@ class LyricsFinder:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = result
                 return result, f"已匹配 · {result.source} · {len(result.lines)} 行"
+            if self.failures:
+                return None, "部分曲目或歌词查询暂未完成，可重新匹配"
             return None, "未找到可靠的同步歌词" if self.reachable else "歌词服务暂时不可用，可点击重新匹配"
         except TimeoutError as exc:
             return None, str(exc)

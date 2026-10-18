@@ -1,6 +1,6 @@
 import base64
 from unittest import TestCase
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -49,6 +49,13 @@ class ParserTests(TestCase):
 
 
 class MatchingTests(TestCase):
+    def test_collaborator_order_and_separators_do_not_change_the_recording(self):
+        expected = Track("Moonlight", "Singer A & Singer B", duration=100)
+        for artist in ("Singer B, Singer A", "Singer A feat. Singer B", "Singer A ＆ Singer B"):
+            self.assertIsNotNone(match_rank(Track("Moonlight", artist, duration=100), [expected]))
+        for artist in ("Singer A", "Singer A & Singer C", "Singer A & Singer B & Singer C", "Singer ASinger B"):
+            self.assertIsNone(match_rank(Track("Moonlight", artist, duration=100), [expected]))
+
     def test_scripts_punctuation_case_and_accents(self):
         self.assertEqual(normalize("遠走高飛（重製）"), normalize("远走高飞(重制)"))
         self.assertEqual(normalize("Beyoncé"), normalize("BEYONCE"))
@@ -75,6 +82,95 @@ class MatchingTests(TestCase):
 
 
 class FinderTests(TestCase):
+    def test_bad_first_download_does_not_hide_a_valid_second_candidate(self):
+        track = Track("月光", "歌手", duration=100)
+        candidates = [dict(id=str(i), accesskey="test", song="月光", singer="歌手", duration=100000) for i in range(2)]
+        self.finder._json = Mock(side_effect=[dict(status=200, candidates=candidates), dict(content="not-base64!"),
+                                             dict(content=base64.b64encode(SAMPLE.encode()).decode())])
+        self.finder._lrclib = Mock(return_value=None)
+        self.finder._aliases = Mock(return_value=[track])
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        document, _ = self.finder.find(track)
+        self.assertIsNotNone(document)
+        self.assertEqual(self.finder._json.call_args.kwargs["id"], "1")
+
+    def test_partial_service_failure_is_not_reported_as_a_complete_empty_search(self):
+        track = Track("月光", "歌手", duration=100)
+        outage = [True]
+        def get(url, **kwargs):
+            if "lrclib" in url and outage[0]:
+                raise requests.ConnectionError("temporary")
+            if "lrclib" in url:
+                payload = []
+            elif "itunes" in url:
+                payload = dict(results=[])
+            elif "songsearch" in url:
+                payload = dict(status=1, data=dict(lists=[]))
+            else:
+                payload = dict(status=200, candidates=[])
+            response = Mock(status_code=200, content=b"{}")
+            response.json.return_value = payload
+            return response
+        self.finder.session.get = Mock(side_effect=get)
+        document, message = self.finder.find(track)
+        self.assertIsNone(document)
+        self.assertIn("查询暂未完成", message)
+        outage[0] = False
+        document, message = self.finder.find(track)
+        self.assertIsNone(document)
+        self.assertEqual(message, "未找到可靠的同步歌词")
+
+    def test_failed_name_lookup_does_not_poison_later_automatic_search(self):
+        track = Track("Moonlight", "Luna", duration=100)
+        document = Lyrics(parse_lrc(SAMPLE), "测试")
+        self.finder._json = Mock(side_effect=[requests.ConnectionError("temporary"),
+            dict(results=[self.apple_record(42, "Moonlight", "Luna", 100000)]),
+            dict(results=[self.apple_record(42, "月光", "露娜", 100000)])])
+        self.finder._kugou = Mock(side_effect=lambda aliases: document if len(aliases) > 1 else None)
+        self.finder._lrclib = Mock(return_value=None)
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        first, _ = self.finder.find(track)
+        second, _ = self.finder.find(track)
+        self.assertIsNone(first)
+        self.assertIs(second, document)
+
+    def test_slow_primary_source_cannot_starve_the_backup_source(self):
+        track = Track("月光", "Artist", duration=100)
+        local = Track("月光", "歌手", duration=100)
+        self.finder._aliases = Mock(return_value=[track, local])
+        clock = [0.]
+        def get(url, params, timeout):
+            clock[0] += min(.2 if "lrclib" in url else 6., sum(timeout))
+            if "lrclib" in url:
+                payload = [dict(trackName="月光", artistName="歌手", duration=100, syncedLyrics=SAMPLE)]
+            elif url.endswith("/download"):
+                payload = dict(content="")
+            else:
+                payload = dict(status=200, candidates=[dict(id=str(i), accesskey="test", song="月光", singer="歌手", duration=100000) for i in range(2)])
+            response = Mock(status_code=200, content=b"{}")
+            response.json.return_value = payload
+            return response
+        self.finder.session.get = Mock(side_effect=get)
+        with patch("moonlyrics.lyrics.time.monotonic", side_effect=lambda: clock[0]):
+            document, _ = self.finder.find(track)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.source, "LRCLIB")
+
+    def test_title_only_fallback_still_validates_the_entire_artist_list(self):
+        track = Track("Moonlight", "Singer A & Singer B", duration=100)
+        def response(url, **params):
+            if params.get("artist_name"):
+                return []
+            return [dict(trackName="Moonlight", artistName="Singer A", duration=100, syncedLyrics=SAMPLE),
+                    dict(trackName="Moonlight", artistName="Singer B, Singer A", duration=100, syncedLyrics=SAMPLE)]
+        self.finder._json = Mock(side_effect=response)
+        self.finder._kugou = Mock(return_value=None)
+        self.finder._aliases = Mock(return_value=[track])
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        document, _ = self.finder.find(track)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.artist, "Singer B, Singer A")
+
     def setUp(self):
         self.finder = LyricsFinder()
         self.addCleanup(self.finder.close)
@@ -96,6 +192,21 @@ class FinderTests(TestCase):
         self.assertEqual(found, document)
         self.assertEqual(self.finder._kugou.call_args.args[0][1].artist, "李聖傑")
         self.assertEqual(self.finder._json.call_args.kwargs["id"], 123)
+
+    def test_one_regional_lookup_failure_does_not_hide_the_other_region(self):
+        track = Track("Far Away", "Sam Lee", duration=270)
+        self.finder._json = Mock(side_effect=[
+            dict(results=[self.apple_record(123, "Far Away", "Sam Lee")]),
+            requests.ConnectionError("one region unavailable"),
+            dict(results=[self.apple_record(123, "遠走高飛", "李聖傑")]),
+        ])
+        self.finder._lrclib = Mock(return_value=None)
+        document = Lyrics(parse_lrc(SAMPLE), "测试")
+        self.finder._kugou = Mock(side_effect=lambda aliases: document if len(aliases) > 1 else None)
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        found, _ = self.finder.find(track)
+        self.assertIs(found, document)
+        self.assertEqual(self.finder._json.call_args.kwargs["country"], "tw")
 
     def test_unrelated_apple_search_result_does_not_create_alias(self):
         self.finder._json = Mock(return_value=dict(results=[self.apple_record(123, "Other", "Someone")]))
@@ -197,3 +308,9 @@ class FinderTests(TestCase):
     def test_cancelled_song_does_not_continue_queries(self):
         with self.assertRaises(SearchCancelled):
             self.finder.find(Track("月光", "歌手", duration=100), cancelled=lambda: True)
+
+    def test_cached_result_also_respects_cancellation(self):
+        track = Track("月光", "歌手", duration=100)
+        self.finder.cache[track, "tr"] = Lyrics(parse_lrc(SAMPLE), "测试")
+        with self.assertRaises(SearchCancelled):
+            self.finder.find(track, cancelled=lambda: True)
