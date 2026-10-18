@@ -126,7 +126,7 @@ class FinderTests(TestCase):
         self.finder._json = Mock(side_effect=[requests.ConnectionError("temporary"),
             dict(results=[self.apple_record(42, "Moonlight", "Luna", 100000)]),
             dict(results=[self.apple_record(42, "月光", "露娜", 100000)])])
-        self.finder._kugou = Mock(side_effect=lambda aliases: document if len(aliases) > 1 else None)
+        self.finder._kugou = Mock(side_effect=lambda aliases, **kwargs: document if len(aliases) > 1 else None)
         self.finder._lrclib = Mock(return_value=None)
         self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
         first, _ = self.finder.find(track)
@@ -174,6 +174,8 @@ class FinderTests(TestCase):
     def setUp(self):
         self.finder = LyricsFinder()
         self.addCleanup(self.finder.close)
+        self.finder._netease = Mock(return_value=None)
+        self.finder._qq = Mock(return_value=None)
 
     def apple_record(self, identifier, title, artist, duration=270000):
         return dict(kind="song", trackId=identifier, trackName=title, artistName=artist,
@@ -187,7 +189,7 @@ class FinderTests(TestCase):
         ])
         self.finder._lrclib = Mock(return_value=None)
         document = Lyrics(parse_lrc(SAMPLE), "测试", "遠走高飛", "李聖傑")
-        self.finder._kugou = Mock(side_effect=lambda aliases: document if len(aliases) > 1 else None)
+        self.finder._kugou = Mock(side_effect=lambda aliases, **kwargs: document if len(aliases) > 1 else None)
         found, _ = self.finder.find(source)
         self.assertEqual(found, document)
         self.assertEqual(self.finder._kugou.call_args.args[0][1].artist, "李聖傑")
@@ -202,11 +204,11 @@ class FinderTests(TestCase):
         ])
         self.finder._lrclib = Mock(return_value=None)
         document = Lyrics(parse_lrc(SAMPLE), "测试")
-        self.finder._kugou = Mock(side_effect=lambda aliases: document if len(aliases) > 1 else None)
+        self.finder._kugou = Mock(side_effect=lambda aliases, **kwargs: document if len(aliases) > 1 else None)
         self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
         found, _ = self.finder.find(track)
         self.assertIs(found, document)
-        self.assertEqual(self.finder._json.call_args.kwargs["country"], "tw")
+        self.assertEqual(self.finder._json.call_args.kwargs["country"], "hk")
 
     def test_unrelated_apple_search_result_does_not_create_alias(self):
         self.finder._json = Mock(return_value=dict(results=[self.apple_record(123, "Other", "Someone")]))

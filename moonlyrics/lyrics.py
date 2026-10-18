@@ -34,12 +34,51 @@ def has_chinese(text):
     return any("\u3400" <= char <= "\u9fff" for char in text)
 
 
+def has_korean(text):
+    return any("\uac00" <= char <= "\ud7af" or "\u1100" <= char <= "\u11ff" for char in text)
+
+
+def split_credit(text):
+    text = _remaster.sub("", unicodedata.normalize("NFKC", str(text or ""))).strip()
+    for pattern in (r"\s*[\[(]\s*(?:feat(?:uring)?|ft)\.?\s+([^\])]+)[\])]\s*$",
+                    r"\s+(?:feat(?:uring)?|ft)\.?\s+(.+)$"):
+        match = re.search(pattern, text, re.I)
+        if match:
+            return text[:match.start()].strip(), match[1].strip()
+    return text, ""
+
+
+def bilingual_parts(text):
+    match = re.fullmatch(r"(.+?)\s*[\[(]([^\[\]()]+)[\])]", unicodedata.normalize("NFKC", text).strip())
+    if match:
+        left, right = match[1].strip(), match[2].strip()
+        asian = lambda value: has_chinese(value) or has_korean(value)
+        if (asian(left) != asian(right) and re.search(r"[A-Za-z]", right if asian(left) else left)
+                and normalize(right) not in ("live", "remix", "cover", "instrumental", "karaoke")):
+            return left, right
+    return ()
+
+
+def artist_parts(value):
+    parts = []
+    for part in re.split(r"\s*(?:[,&、，;；]|\b(?:feat(?:uring)?|ft)\.?\s+)\s*",
+                         unicodedata.normalize("NFKC", value), flags=re.I):
+        keys = {normalize(name) for name in (part, *bilingual_parts(part)) if normalize(name)}
+        if keys and not any(keys & known for known in parts):
+            parts.append(keys)
+    return parts
+
+
 def same_artists(left, right):
-    split = lambda value: sorted(normalize(part) for part in re.split(
-        r"\s*(?:[,&、，;；]|\b(?:feat(?:uring)?|ft)\.?\s+)\s*",
-        unicodedata.normalize("NFKC", value), flags=re.I) if normalize(part))
-    left_parts, right_parts = split(left), split(right)
-    return bool(left_parts) and left_parts == right_parts
+    left_parts, remaining = artist_parts(left), artist_parts(right)
+    if not left_parts or len(left_parts) != len(remaining) or len(left_parts) > 16:
+        return False
+    for part in left_parts:
+        matches = [index for index, other in enumerate(remaining) if part & other]
+        if len(matches) != 1:
+            return False
+        remaining.pop(matches[0])
+    return True
 
 
 @dataclass(frozen=True)
@@ -122,10 +161,16 @@ def match_rank(candidate, aliases, tolerance=5):
     ranks = []
     if not candidate.title or not candidate.artist:
         return None
+    title, guests = split_credit(candidate.title)
+    known_titles = {title_name(split_credit(alias.title)[0]) for alias in aliases}
+    if title_name(title) not in known_titles:
+        bilingual = bilingual_parts(title)
+        if not bilingual or not all(title_name(part) in known_titles for part in bilingual):
+            return None
     for expected in aliases:
-        if title_name(candidate.title) != title_name(expected.title):
-            continue
-        if not same_artists(candidate.artist, expected.artist):
+        expected_guests = split_credit(expected.title)[1]
+        if not same_artists(" & ".join(filter(None, (candidate.artist, guests))),
+                            " & ".join(filter(None, (expected.artist, expected_guests)))):
             continue
         difference = abs(candidate.duration - expected.duration)
         if expected.duration > 0 and (candidate.duration <= 0 or difference > tolerance):
@@ -179,7 +224,7 @@ class LyricsFinder:
         finally:
             self.stage_deadline = previous
 
-    def _json(self, url, **params):
+    def _json(self, url, *, body=None, headers=None, **params):
         self._check()
         response = None
         try:
@@ -188,7 +233,11 @@ class LyricsFinder:
                 if self.deadline - time.monotonic() <= .1:
                     raise TimeoutError("歌词匹配超时，可以重新尝试")
                 raise StageExpired()
-            response = self.session.get(url, params=params, timeout=(min(1.5, remaining * .35), min(3., remaining * .65)))
+            options = dict(timeout=(min(1.5, remaining * .35), min(3., remaining * .65)))
+            if headers:
+                options["headers"] = headers
+            response = (self.session.get(url, params=params, **options) if body is None
+                        else self.session.post(url, params=params, json=body, **options))
             response.raise_for_status()
             if len(response.content) > 3_000_000:
                 raise ValueError("Lyrics response is too large")
@@ -226,7 +275,8 @@ class LyricsFinder:
             matches = [item for item in matches if item[0] is not None and item[1]]
             if matches:
                 _, identifier, original = min(matches, key=lambda item: item[0])
-                for country in ("hk", "tw"):
+                chinese = has_chinese(track.title + track.artist + track.album)
+                for country in (("hk", "tw", "kr") if chinese else ("kr", "hk", "tw")):
                     try:
                         localized = self._json("https://itunes.apple.com/lookup", id=identifier, country=country, entity="song")
                         if not isinstance(localized, dict) or not isinstance(localized.get("results"), list):
@@ -241,7 +291,8 @@ class LyricsFinder:
                     except (requests.RequestException, ValueError, TypeError, KeyError) as error:
                         self.failures.add("Apple localized names")
                         LOG.info("Localized name lookup failed: country=%s error=%s", country, type(error).__name__)
-                    if any(has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
+                    if any(has_korean(alias.title + alias.artist)
+                           or has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
         except (requests.RequestException, ValueError, TypeError, KeyError):
             LOG.debug("Apple localized name lookup unavailable", exc_info=True)
@@ -374,6 +425,120 @@ class LyricsFinder:
                 LOG.debug("LRCLIB lyrics unavailable", exc_info=True)
         return None
 
+    @staticmethod
+    def _search_queries(aliases):
+        return list(dict.fromkeys(_simplified.convert(f"{track.artist} {split_credit(track.title)[0]}").strip()
+                                  for track in aliases))[:3]
+
+    def _netease(self, aliases, tolerance=5):
+        headers = {"Referer": "https://music.163.com/"}
+        for query in self._search_queries(aliases):
+            try:
+                data = self._json("https://music.163.com/api/search/get", headers=headers, s=query, type=1, limit=20)
+                result = data.get("result") if isinstance(data, dict) else None
+                if not isinstance(data, dict) or data.get("code") != 200 or not isinstance(result, dict):
+                    self.failures.add("网易云音乐")
+                    LOG.info("Lyric service unavailable: provider=NetEase code=%s", data.get("code") if isinstance(data, dict) else None)
+                    return None
+                songs = result.get("songs", [])
+                if not isinstance(songs, list):
+                    self.failures.add("网易云音乐")
+                    return None
+                self.reachable = True
+                matches = []
+                for item in songs[:50]:
+                    if not isinstance(item, dict) or not isinstance(item.get("artists"), list):
+                        continue
+                    names = [artist.get("name") for artist in item["artists"] if isinstance(artist, dict)]
+                    album = item.get("album")
+                    if (not names or len(names) != len(item["artists"])
+                            or not all(isinstance(name, str) and name for name in names) or not isinstance(album, dict)):
+                        continue
+                    candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
+                                      finite(item.get("duration")) / 1000)
+                    rank = match_rank(candidate, aliases, tolerance)
+                    identifier = item.get("id")
+                    if rank is not None and type(identifier) is int and 0 < identifier < 10 ** 15:
+                        matches.append((rank, identifier, candidate))
+                LOG.info("Lyric search: provider=NetEase candidates=%s accepted=%s", len(songs), len(matches))
+                for _, identifier, candidate in sorted(matches, key=lambda item: item[0])[:2]:
+                    try:
+                        payload = self._json("https://music.163.com/api/song/lyric", headers=headers,
+                                             id=identifier, lv=-1, kv=-1, tv=-1)
+                        if not isinstance(payload, dict) or payload.get("code") != 200:
+                            self.failures.add("网易云音乐歌词")
+                            continue
+                        lrc = payload.get("lrc")
+                        lines = parse_lrc(html.unescape(lrc.get("lyric") or "")) if isinstance(lrc, dict) else ()
+                        if lines:
+                            return Lyrics(lines, "网易云音乐", candidate.title, candidate.artist)
+                    except (requests.RequestException, ValueError, TypeError, KeyError):
+                        self.failures.add("网易云音乐歌词")
+            except (requests.RequestException, ValueError, TypeError, KeyError):
+                self.failures.add("网易云音乐")
+        return None
+
+    def _qq(self, aliases, tolerance=5):
+        headers = {"Referer": "https://y.qq.com/"}
+        for query in self._search_queries(aliases):
+            try:
+                body = dict(comm=dict(ct="19", cv="1859", uin="0"), req=dict(method="DoSearchForQQMusicDesktop",
+                    module="music.search.SearchCgiService", param=dict(grp=1, num_per_page=20, page_num=1, query=query, search_type=0)))
+                data = self._json("https://u.y.qq.com/cgi-bin/musicu.fcg", headers=headers, body=body)
+                request = data.get("req") if isinstance(data, dict) else None
+                if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(request, dict) or request.get("code") != 0:
+                    self.failures.add("QQ音乐")
+                    LOG.info("Lyric service unavailable: provider=QQMusic code=%s", request.get("code") if isinstance(request, dict) else None)
+                    return None
+                container = request
+                for key in ("data", "body", "song"):
+                    container = container.get(key) if isinstance(container, dict) else None
+                songs = container.get("list") if isinstance(container, dict) else None
+                if not isinstance(songs, list):
+                    self.failures.add("QQ音乐")
+                    return None
+                self.reachable = True
+                matches = []
+                for item in songs[:50]:
+                    if not isinstance(item, dict) or not isinstance(item.get("singer"), list):
+                        continue
+                    names = [artist.get("name") for artist in item["singer"] if isinstance(artist, dict)]
+                    album = item.get("album")
+                    if (not names or len(names) != len(item["singer"])
+                            or not all(isinstance(name, str) and name for name in names) or not isinstance(album, dict)):
+                        continue
+                    candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
+                                      finite(item.get("interval")))
+                    rank = match_rank(candidate, aliases, tolerance)
+                    mid = item.get("mid")
+                    if rank is not None and isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", mid):
+                        matches.append((rank, mid, candidate))
+                LOG.info("Lyric search: provider=QQMusic candidates=%s accepted=%s", len(songs), len(matches))
+                for _, mid, candidate in sorted(matches, key=lambda item: item[0])[:2]:
+                    try:
+                        payload = self._json("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", headers=headers,
+                                             songmid=mid, format="json", nobase64=1)
+                        if not isinstance(payload, dict) or payload.get("code") != 0:
+                            self.failures.add("QQ音乐歌词")
+                            continue
+                        lines = parse_lrc(html.unescape(payload.get("lyric") or ""))
+                        if lines:
+                            return Lyrics(lines, "QQ音乐", candidate.title, candidate.artist)
+                    except (requests.RequestException, ValueError, TypeError, KeyError):
+                        self.failures.add("QQ音乐歌词")
+            except (requests.RequestException, ValueError, TypeError, KeyError):
+                self.failures.add("QQ音乐")
+        return None
+
+    def _search_sources(self, aliases, providers, tolerance=5, reserve=0.):
+        for index, provider in enumerate(providers):
+            remaining = self.deadline - time.monotonic() - reserve
+            budget = min(4., max(.1, remaining / (len(providers) - index)))
+            found = self._run_stage(provider, aliases, tolerance=tolerance, budget=budget)
+            if found:
+                return found
+        return None
+
     def find(self, track, storefront="tr", cancelled=lambda: False, force=False):
         self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
         self.failures = set()
@@ -387,25 +552,17 @@ class LyricsFinder:
         self.cache.pop(key, None)
         try:
             self._check()
-            base_aliases = [track]
-            aliases = base_aliases
-            localized = False
-            mixed = has_chinese(track.title + track.artist + track.album) and not (
-                has_chinese(track.title) and has_chinese(track.artist))
-            if mixed:
-                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
-                localized = True
-            chinese = any(has_chinese(item.title + item.artist) for item in aliases)
-            providers = (self._kugou, self._lrclib) if chinese else (self._lrclib, self._kugou)
-            result = next((found for provider in providers if (found := self._run_stage(provider, aliases))), None)
-            if result is None and not localized:
-                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
-                if aliases != base_aliases:
-                    result = self._run_stage(self._kugou, aliases) or self._run_stage(self._lrclib, aliases)
+            base_aliases = aliases = [track]
+            preferred = (self._kugou, self._lrclib) if has_chinese(track.title + track.artist) else (self._lrclib, self._kugou)
+            providers = (*preferred, self._netease, self._qq)
+            result = self._run_stage(providers[0], aliases, budget=3.)
             if result is None:
-                expanded = self._run_stage(self._catalog_aliases, aliases, budget=3.) or aliases
+                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
+                result = self._search_sources(aliases, providers if aliases != base_aliases else providers[1:], reserve=2.)
+            if result is None:
+                expanded = self._run_stage(self._catalog_aliases, aliases, budget=2.) or aliases
                 if expanded != aliases:
-                    result = self._run_stage(self._kugou, expanded, tolerance=2) or self._run_stage(self._lrclib, expanded, tolerance=2)
+                    result = self._search_sources(expanded, providers, tolerance=2)
                     if result is not None:
                         self.alias_cache[key] = expanded
             self._check()
