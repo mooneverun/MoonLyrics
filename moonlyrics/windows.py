@@ -19,10 +19,12 @@ from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QGridLayout,
-                            QHBoxLayout, QLabel, QMessageBox, QPushButton,
+                            QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
                             QSlider, QVBoxLayout, QWidget)
 
 from .styles import DEFAULTS, LIMITS, PRESETS, normalized, transparency_amount
+from .playback import PlaybackSnapshot, STATUS_LABELS, format_time
+from .windows_media import AppleMusicReader, media_probe
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "MoonLyrics"
 LEGACY_DIR = APP_DIR.parent / "LyricFloatGlassSample"
@@ -238,6 +240,8 @@ class GlassView(QOpenGLWidget):
         self.gpu_ms = None
         self.gpu_pending = False
         self.show_text = True
+        self.primary_text = "等待 Apple Music"
+        self.secondary_text = "播放音乐后显示歌曲与进度"
         self.dark_text = False
         self.renderer = "正在初始化显卡…"
         self.light = QVector2D(-.7, .8)
@@ -423,11 +427,19 @@ class GlassView(QOpenGLWidget):
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             font = QFont("Microsoft YaHei UI", 20)
             font.setWeight(QFont.Weight.Medium); painter.setFont(font)
-            center = QRectF(8, self.height() / 2 - 19, self.width() - 16, 38)
+            center = QRectF(16, self.height() / 2 - 28, self.width() - 32, 36)
+            title = painter.fontMetrics().elidedText(self.primary_text, Qt.TextElideMode.ElideRight,
+                                                     max(1, self.width() - 32))
             painter.setPen(QColor(255, 255, 255, 100) if self.dark_text else QColor(0, 0, 0, 150))
-            painter.drawText(center.translated(0, 1), Qt.AlignmentFlag.AlignCenter, "晚风轻轻掠过窗台")
+            painter.drawText(center.translated(0, 1), Qt.AlignmentFlag.AlignCenter, title)
             painter.setPen(QColor(24, 38, 50) if self.dark_text else QColor(250, 253, 255))
-            painter.drawText(center, Qt.AlignmentFlag.AlignCenter, "晚风轻轻掠过窗台")
+            painter.drawText(center, Qt.AlignmentFlag.AlignCenter, title)
+            painter.setFont(QFont("Microsoft YaHei UI", 10))
+            subtitle = painter.fontMetrics().elidedText(self.secondary_text, Qt.TextElideMode.ElideRight,
+                                                        max(1, self.width() - 32))
+            painter.setPen(QColor(24, 38, 50, 200) if self.dark_text else QColor(250, 253, 255, 220))
+            painter.drawText(QRectF(16, self.height() / 2 + 9, self.width() - 32, 23),
+                             Qt.AlignmentFlag.AlignCenter, subtitle)
             painter.end()
 
     def shutdown(self):
@@ -527,7 +539,7 @@ class GlassWindow(QWidget):
 
 
 class Controls(QWidget):
-    def __init__(self, settings, save=True):
+    def __init__(self, settings, save=True, media=True):
         super().__init__()
         self.settings, self.save_enabled = settings, save
         self.setWindowTitle("MoonLyrics · 月光歌词设置")
@@ -537,13 +549,32 @@ class Controls(QWidget):
         self.usage = Usage()
         self.samples = []
         self.sliders = {}
+        self.playback = PlaybackSnapshot()
+        self.media_reader = None
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
         self.setMinimumWidth(470)
         layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 20); layout.setSpacing(12)
         title = QLabel("MoonLyrics · 月光歌词"); title.setStyleSheet("font-size: 20px; font-weight: 500;")
         layout.addWidget(title)
-        help_text = QLabel("按住悬浮条拖动到网页、文字或视频上，观察背景变化。\n当前为玻璃界面原型，Apple Music 与歌词接入开发中。")
+        help_text = QLabel("打开 Windows 版 Apple Music 播放歌曲，悬浮条会显示歌曲与进度。\n按住悬浮条可拖动；歌词搜索与同步滚动将在后续接入。")
         help_text.setWordWrap(True); layout.addWidget(help_text)
+        self.track_title = QLabel("等待 Apple Music")
+        self.track_title.setWordWrap(True)
+        self.track_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.track_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.track_title.setStyleSheet("font-size: 16px; font-weight: 500;")
+        self.track_details = QLabel("打开 Apple Music 并播放一首歌曲")
+        self.track_details.setWordWrap(True); self.track_details.setTextFormat(Qt.TextFormat.PlainText)
+        self.track_details.setStyleSheet("color: #66778a;")
+        layout.addWidget(self.track_title); layout.addWidget(self.track_details)
+        media_row = QHBoxLayout()
+        self.media_status = QLabel("等待 Apple Music"); self.media_time = QLabel("0:00 / --:--")
+        media_row.addWidget(self.media_status); media_row.addStretch(); media_row.addWidget(self.media_time)
+        layout.addLayout(media_row)
+        self.media_progress = QProgressBar(); self.media_progress.setRange(0, 1000)
+        self.media_progress.setTextVisible(False); self.media_progress.setFixedHeight(6)
+        self.media_progress.setValue(0); self.media_progress.setAccessibleName("Apple Music 播放进度")
+        layout.addWidget(self.media_progress)
         layout.addWidget(QLabel("玻璃风格"))
         preset_row = QHBoxLayout()
         self.preset_group = QButtonGroup(self)
@@ -604,6 +635,33 @@ class Controls(QWidget):
         self.glass.move(screen.center().x() - settings["width"] // 2, screen.top() + 160)
         self.adjustSize()
         self.move(screen.left() + 40, max(screen.top() + 20, screen.bottom() - self.height() - 30))
+        self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
+        self.media_timer.start(100)
+        if media:
+            self.media_reader = AppleMusicReader(self)
+            self.media_reader.snapshot_changed.connect(self.set_playback)
+            self.media_reader.start()
+
+    def set_playback(self, snapshot):
+        self.playback = snapshot
+        self.track_title.setText(snapshot.title or "等待 Apple Music")
+        self.track_details.setText(" · ".join(value for value in (snapshot.artist, snapshot.album) if value)
+                                   or "打开 Apple Music 并播放一首歌曲")
+        self.media_status.setToolTip(snapshot.message)
+        self.update_playback_display()
+
+    def update_playback_display(self):
+        snapshot = self.playback
+        position = snapshot.position_at()
+        state = STATUS_LABELS.get(snapshot.status, "等待播放")
+        timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
+        self.media_status.setText(state); self.media_time.setText(timing)
+        self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
+        primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
+        secondary = timing + " · " + state if snapshot.title else "播放音乐后显示歌曲与进度"
+        if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
+            self.glass.view.primary_text, self.glass.view.secondary_text = primary, secondary
+            self.glass.view.update()
 
     def set_preset(self, name):
         preset = PRESETS[name]
@@ -645,6 +703,13 @@ class Controls(QWidget):
         self.hardware.setText("显卡：" + view.renderer)
 
     def closeEvent(self, event):
+        if self.media_reader is not None:
+            self.media_reader.stop()
+            if not self.media_reader.wait(1500):
+                event.ignore()
+                QTimer.singleShot(100, self.close)
+                return
+        self.media_timer.stop()
         self.sample_timer.stop()
         self.glass.close()
         if self.save_enabled:
@@ -836,6 +901,13 @@ def self_test(app, control, report_path, preview_path):
             result["profiles"][name] = {key: statistics.mean(s[key] for s in samples if s[key] is not None)
                                         for key in samples[0] if any(s[key] is not None for s in samples)}
         parameters(preset="soft", transparency_level=1, width=583, height=80, fps=30)
+        control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
+                                             album="播放信息测试", status="paused", position=64., duration=270.))
+        assert control.media_time.text() == "1:04 / 4:30"
+        assert control.media_status.text() == "已暂停"
+        assert control.media_progress.value() == round(64 / 270 * 1000)
+        assert "月光轻轻落在窗台" in glass.view.primary_text
+        result["playback_display"] = True
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
         result["ok"] = True
@@ -856,6 +928,7 @@ def self_test(app, control, report_path, preview_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--media-probe", action="store_true")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--preview", type=Path)
     args = parser.parse_args()
@@ -874,6 +947,8 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("MoonLyrics")
     app.setStyle("Fusion"); app.setFont(QFont("Microsoft YaHei UI", 10))
+    if args.media_probe:
+        return media_probe(app, args.report)
     settings = dict(DEFAULTS)
     if not args.self_test:
         for directory in (APP_DIR, LEGACY_DIR):
@@ -883,7 +958,7 @@ def main():
             except (OSError, ValueError, TypeError):
                 continue
     try:
-        control = Controls(settings, save=not args.self_test)
+        control = Controls(settings, save=not args.self_test, media=not args.self_test)
         if args.self_test:
             return self_test(app, control, args.report, args.preview)
         control.show(); control.glass.show()
