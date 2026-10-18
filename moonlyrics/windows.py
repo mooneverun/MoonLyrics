@@ -28,6 +28,7 @@ from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
 from .lyrics_worker import LyricsWorker
 from .lyric_paint import lyric_layer
+from .settings_ui import SettingsWindow, application_icon
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "MoonLyrics"
 LEGACY_DIR = APP_DIR.parent / "LyricFloatGlassSample"
@@ -567,7 +568,7 @@ class GlassWindow(QWidget):
         super().closeEvent(event)
 
 
-class Controls(QWidget):
+class Controls(SettingsWindow):
     def __init__(self, settings, save=True, media=True):
         super().__init__()
         self.settings, self.save_enabled = settings, save
@@ -590,20 +591,15 @@ class Controls(QWidget):
         self.lyric_debounce.timeout.connect(self.request_lyrics)
         self.closing = False
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
-        self.setMinimumWidth(470)
-        layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 20); layout.setSpacing(12)
-        title = QLabel("MoonLyrics · 月光歌词"); title.setStyleSheet("font-size: 20px; font-weight: 500;")
-        layout.addWidget(title)
-        help_text = QLabel("播放 Apple Music，歌词会在玻璃框内居中滚动、上下渐隐。\n按住悬浮条可拖动；锁定后允许鼠标穿透。")
-        help_text.setWordWrap(True); layout.addWidget(help_text)
+        layout = self.section("正在播放")
         self.track_title = QLabel("等待 Apple Music")
         self.track_title.setWordWrap(True)
         self.track_title.setTextFormat(Qt.TextFormat.PlainText)
         self.track_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.track_title.setStyleSheet("font-size: 16px; font-weight: 500;")
+        self.track_title.setObjectName("trackTitle")
         self.track_details = QLabel("打开 Apple Music 并播放一首歌曲")
         self.track_details.setWordWrap(True); self.track_details.setTextFormat(Qt.TextFormat.PlainText)
-        self.track_details.setStyleSheet("color: #66778a;")
+        self.track_details.setObjectName("trackDetails")
         layout.addWidget(self.track_title); layout.addWidget(self.track_details)
         media_row = QHBoxLayout()
         self.media_status = QLabel("等待 Apple Music"); self.media_time = QLabel("0:00 / --:--")
@@ -613,6 +609,7 @@ class Controls(QWidget):
         self.media_progress.setTextVisible(False); self.media_progress.setFixedHeight(6)
         self.media_progress.setValue(0); self.media_progress.setAccessibleName("Apple Music 播放进度")
         layout.addWidget(self.media_progress)
+        layout = self.section("歌词匹配")
         lyric_row = QHBoxLayout()
         lyric_row.addWidget(QLabel("曲目地区")); self.storefront = QComboBox()
         for code, label in (("tr", "土耳其"), ("cn", "中国大陆"), ("hk", "香港"), ("tw", "台湾"), ("us", "美国")):
@@ -624,8 +621,9 @@ class Controls(QWidget):
         self.retry_lyrics = QPushButton("重新匹配"); self.retry_lyrics.setEnabled(False)
         self.retry_lyrics.clicked.connect(lambda: self.request_lyrics(force=True))
         lyric_row.addWidget(self.retry_lyrics); layout.addLayout(lyric_row)
+        source_caption = QLabel("歌词源顺序 · 从左到右优先")
+        source_caption.setObjectName("secondary"); layout.addWidget(source_caption)
         source_row = QHBoxLayout(); source_row.setSpacing(4)
-        source_row.addWidget(QLabel("歌词源顺序"))
         self.source_choices = []
         for position, source in enumerate(settings["lyric_source_order"]):
             if position:
@@ -642,7 +640,8 @@ class Controls(QWidget):
         layout.addLayout(source_row)
         self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
         self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
-        timing_row = QHBoxLayout(); timing_row.addWidget(QLabel("歌词校准"))
+        timing_caption = QHBoxLayout(); timing_caption.addWidget(QLabel("歌词校准")); timing_caption.addStretch()
+        timing_row = QHBoxLayout()
         earlier = QPushButton("提前 0.1 秒"); later = QPushButton("延后 0.1 秒")
         reset_timing = QPushButton("重置")
         earlier.clicked.connect(lambda: self.change_lyric_offset(100))
@@ -652,9 +651,10 @@ class Controls(QWidget):
         self.lyric_timing.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lyric_timing.setText(self.offset_label())
         self.lyric_timing.setToolTip("所有来源默认提前 1 秒，按钮在此基础上微调；重置回到提前 1 秒。\n只校准歌词，不改变歌曲播放进度。")
-        for widget in (earlier, self.lyric_timing, later, reset_timing): timing_row.addWidget(widget)
+        timing_caption.addWidget(self.lyric_timing); layout.addLayout(timing_caption)
+        for widget in (earlier, later, reset_timing): timing_row.addWidget(widget)
         layout.addLayout(timing_row)
-        layout.addWidget(QLabel("玻璃风格"))
+        layout = self.section("玻璃外观")
         preset_row = QHBoxLayout()
         self.preset_group = QButtonGroup(self)
         self.preset_group.setExclusive(True)
@@ -664,13 +664,14 @@ class Controls(QWidget):
             button.setCheckable(True); button.setChecked(key == settings["preset"])
             button.setAccessibleName(preset["label"] + "玻璃风格")
             button.setToolTip(preset["description"])
-            button.setStyleSheet("QPushButton {padding: 9px 14px; border: 1px solid #b8c4d0; border-radius: 7px;} QPushButton:checked {background: #dcebf9; color: #173750; border-color: #7faace;}")
+            button.setProperty("glassChoice", True)
             button.clicked.connect(lambda checked, name=key: self.set_preset(name))
             self.preset_group.addButton(button)
             self.preset_buttons[key] = button
             preset_row.addWidget(button)
         layout.addLayout(preset_row)
         self.preset_description = QLabel(PRESETS[settings["preset"]]["description"])
+        self.preset_description.setObjectName("secondary")
         self.preset_description.setWordWrap(True); layout.addWidget(self.preset_description)
         grid = QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(14)
         labels = dict(transparency_level="背景透明度", width="玻璃条宽度", height="玻璃条高度")
@@ -702,17 +703,21 @@ class Controls(QWidget):
         layout.addLayout(row)
         self.lock = QCheckBox("锁定悬浮条，允许鼠标穿透（在这里解锁）")
         self.lock.toggled.connect(self.glass.set_locked); layout.addWidget(self.lock)
+        help_text = QLabel("按住歌词条可拖动；锁定后鼠标可穿透。设置界面跟随玻璃风格。")
+        help_text.setObjectName("secondary"); help_text.setWordWrap(True); layout.addWidget(help_text)
+        layout = self.section("运行状态")
         self.stats = QLabel("正在测量 CPU、内存与实际帧率…"); self.stats.setWordWrap(True); layout.addWidget(self.stats)
         self.timing = QLabel(); self.timing.setWordWrap(True); layout.addWidget(self.timing)
         self.hardware = QLabel("正在识别显卡…"); self.hardware.setWordWrap(True); layout.addWidget(self.hardware)
         footer = QLabel("桌面画面仅在本机处理，不保存、不上传。\n歌词匹配会向曲目和歌词服务查询歌名、歌手与时长。\nCPU 为整机归一化占比；GPU 显示材质绘制耗时。")
-        footer.setWordWrap(True); footer.setStyleSheet("color: #66778a; font-size: 12px;"); layout.addWidget(footer)
+        footer.setWordWrap(True); footer.setObjectName("secondary"); layout.addWidget(footer)
         self.status = QLabel("拖动后方的网页或播放视频，可检验真实背景取样。")
         self.status.setWordWrap(True); layout.addWidget(self.status)
         self.sample_timer = QTimer(self); self.sample_timer.timeout.connect(self.sample); self.sample_timer.start(1000)
         screen = QApplication.primaryScreen().availableGeometry()
         self.glass.move(screen.center().x() - settings["width"] // 2, screen.top() + 160)
-        self.adjustSize()
+        self.apply_material(settings["preset"])
+        self.resize(min(610, screen.width() - 60), min(980, screen.height() - 80))
         self.move(screen.left() + 40, max(screen.top() + 20, screen.bottom() - self.height() - 30))
         self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
         self.media_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -823,6 +828,7 @@ class Controls(QWidget):
         self.settings.update(preset=name, blur=preset["blur"], refraction=preset["refraction"])
         self.preset_buttons[name].setChecked(True)
         self.preset_description.setText(preset["description"])
+        self.apply_material(name)
         self.glass.refresh()
 
     def fps_changed(self):
@@ -841,7 +847,8 @@ class Controls(QWidget):
     def failed(self, message):
         self.error = message
         self.status.setText("已停止刷新：" + message)
-        self.status.setStyleSheet("color: #b43c43;")
+        self.status.setObjectName("errorStatus")
+        self.status.style().unpolish(self.status); self.status.style().polish(self.status)
         self.pause.setText("重试刷新")
 
     def sample(self):
@@ -1135,6 +1142,39 @@ def self_test(app, control, report_path, preview_path):
         result["lyrics_viewport"] = dict(clipped=True, edge_fade=True, center_emphasis=True,
                                          animated_scroll=True, seek_and_pause=True, stale_result_rejected=True,
                                          jitter_no_rewind=True, arrives_on_cue=True, timing_calibration=True)
+        from .settings_ui import MATERIALS
+        assert not app.windowIcon().isNull() and not control.windowIcon().isNull()
+        control.move(screen.right() - control.width() - 30, screen.top() + 30)
+        control.show(); QTest.qWait(200)
+        original_size = control.size()
+        control.resize(control.minimumWidth(), control.minimumHeight()); QTest.qWait(100)
+        assert control.scroll.widget().width() <= control.scroll.viewport().width(), "Settings fields are clipped at minimum width"
+        control.resize(original_size)
+        QTest.mouseDClick(control.title_bar, Qt.MouseButton.LeftButton, pos=QPoint(250, 25))
+        QTest.qWait(100); assert control.isMaximized()
+        QTest.mouseDClick(control.title_bar, Qt.MouseButton.LeftButton, pos=QPoint(250, 25))
+        QTest.qWait(100); assert not control.isMaximized()
+        for name in PRESETS:
+            control.preset_buttons[name].click(); QTest.qWait(100)
+            assert control.property("glassPreset") == name and control.material == MATERIALS[name]
+            assert control.settings["preset"] == name and control.preset_buttons[name].isChecked()
+            if preview_path:
+                control.grab().save(str(preview_path.with_name(f"settings-{name}.png")))
+        control.set_preset("soft")
+        with patch("moonlyrics.settings_ui.native_backdrop", return_value=False):
+            control.update_backdrop(); QTest.qWait(50)
+            fallback = control.grab().toImage()
+            ratio = fallback.devicePixelRatio()
+            pixel = fallback.pixelColor(round(15 * ratio), round(200 * ratio))
+            assert pixel.alpha() == 255 and pixel.getRgb()[:3] == MATERIALS["soft"][:3], pixel.getRgb()
+        control.update_backdrop()
+        scroll = control.scroll.verticalScrollBar()
+        scroll.setValue(scroll.maximum()); QTest.qWait(100)
+        assert scroll.value() == scroll.maximum()
+        assert control.status.isVisibleTo(control.scroll)
+        scroll.setValue(0)
+        result["settings_ui"] = dict(preset_sync=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
+                                      native_backdrop=control.backdrop_active)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
@@ -1175,6 +1215,9 @@ def main():
     fmt.setSwapInterval(0); QSurfaceFormat.setDefaultFormat(fmt)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("MoonLyrics")
+    app.setWindowIcon(application_icon())
+    app_id = api(C.WinDLL("shell32"), "SetCurrentProcessExplicitAppUserModelID", C.c_long, W.LPCWSTR)
+    app_id("mooneverun.MoonLyrics")
     app.setStyle("Fusion"); app.setFont(QFont("Microsoft YaHei UI", 10))
     if args.media_probe:
         return media_probe(app, args.report)
