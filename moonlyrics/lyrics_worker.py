@@ -5,6 +5,7 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .lyrics import LyricsFinder, SearchCancelled
+from .styles import normalized_source_order
 
 LOG = logging.getLogger("moonlyrics.lyrics")
 
@@ -20,10 +21,10 @@ class LyricsWorker(QThread):
         self.latest = 0
         self.pending = None
 
-    def request(self, request_id, track, storefront, force=False):
+    def request(self, request_id, track, storefront, force=False, source_order=None):
         with self.lock:
             self.latest = request_id
-            self.pending = (request_id, track, storefront, force) if track else None
+            self.pending = (request_id, track, storefront, force, normalized_source_order(source_order)) if track else None
             self.wake.set()
 
     def stop(self):
@@ -39,15 +40,15 @@ class LyricsWorker(QThread):
                     self.wake.clear()
                 if job is None:
                     continue
-                request_id, track, storefront, force = job
+                request_id, track, storefront, force, source_order = job
                 cancelled = lambda: self.isInterruptionRequested() or request_id != self.latest
-                LOG.info("Lyric match started: request=%s duration=%.2f", request_id, track.duration)
+                LOG.info("Lyric match started: request=%s duration=%.2f order=%s", request_id, track.duration, ">".join(source_order))
                 for attempt, delay in enumerate((0.,) + self.retry_delays):
                     # A new song, manual retry or shutdown wakes this wait immediately.
                     if (delay and self.wake.wait(delay)) or cancelled():
                         break
                     try:
-                        document, message = finder.find(track, storefront, cancelled, force or attempt > 0)
+                        document, message = finder.find(track, storefront, cancelled, force or attempt > 0, source_order)
                     except SearchCancelled:
                         break
                     except Exception:

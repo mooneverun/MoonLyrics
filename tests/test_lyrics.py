@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from moonlyrics.lyrics import Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track, match_rank, normalize, parse_lrc, related_artist_name
+from moonlyrics.styles import DEFAULTS
 
 SAMPLE = "[00:01.00]窗前的月光\n[00:03.50]慢慢经过身旁\n[00:06.00]\n[00:08.00]下一句轻轻唱"
 
@@ -313,6 +314,6 @@ class FinderTests(TestCase):
 
     def test_cached_result_also_respects_cancellation(self):
         track = Track("月光", "歌手", duration=100)
-        self.finder.cache[track, "tr"] = Lyrics(parse_lrc(SAMPLE), "测试")
+        self.finder.cache[track, "tr", DEFAULTS["lyric_source_order"]] = Lyrics(parse_lrc(SAMPLE), "测试")
         with self.assertRaises(SearchCancelled):
             self.finder.find(track, cancelled=lambda: True)

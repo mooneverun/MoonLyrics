@@ -84,3 +84,31 @@ class MatchingFlowTests(TestCase):
         jobs = [call for call in self.worker.request.call_args_list if call.args[1] is not None]
         self.assertEqual(len(jobs), 1)
         self.assertTrue(jobs[0].args[3])
+
+    def test_source_priority_swaps_positions_and_rematches_only_once(self):
+        from PyQt6.QtTest import QTest
+        from moonlyrics.lyrics import Lyrics, LyricLine
+        self.control.set_playback(self.snapshot())
+        stale = self.control.lyric_request
+        self.worker.request.reset_mock()
+        self.control.source_choices[0].setCurrentIndex(self.control.source_choices[0].findData("qq"))
+        self.assertEqual(self.control.settings["lyric_source_order"], ("qq", "lrclib", "netease", "kugou"))
+        self.control.source_choices[1].setCurrentIndex(self.control.source_choices[1].findData("netease"))
+        QTest.qWait(750)
+        order = ("qq", "netease", "lrclib", "kugou")
+        self.assertEqual(tuple(choice.currentData() for choice in self.control.source_choices), order)
+        self.assertEqual(self.worker.request.call_count, 2)
+        self.assertTrue(self.worker.request.call_args.args[3])
+        self.assertEqual(self.worker.request.call_args.args[4], order)
+        self.control.accept_lyrics(stale, Lyrics((LyricLine(1, "月光"),), "旧来源"), "stale")
+        self.assertIsNone(self.control.glass.view.lyrics)
+
+    def test_saved_priority_is_restored_in_the_settings_controls(self):
+        import json
+        from moonlyrics.styles import normalized
+        from moonlyrics.windows import Controls
+        self.control.source_choices[0].setCurrentIndex(self.control.source_choices[0].findData("netease"))
+        settings = normalized(json.loads(json.dumps(self.control.settings)))
+        restored = Controls(settings, save=False, media=False)
+        self.addCleanup(restored.close)
+        self.assertEqual(tuple(choice.currentData() for choice in restored.source_choices), settings["lyric_source_order"])

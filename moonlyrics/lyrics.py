@@ -12,6 +12,7 @@ from opencc import OpenCC
 import requests
 
 from .playback import finite
+from .styles import normalized_source_order
 
 LOG = logging.getLogger("moonlyrics.lyrics")
 _simplified, _traditional = OpenCC("t2s"), OpenCC("s2t")
@@ -539,22 +540,23 @@ class LyricsFinder:
                 return found
         return None
 
-    def find(self, track, storefront="tr", cancelled=lambda: False, force=False):
+    def find(self, track, storefront="tr", cancelled=lambda: False, force=False, source_order=None):
         self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
         self.failures = set()
         self._check()
-        key = track, storefront
+        order = normalized_source_order(source_order)
+        key = track, storefront, order
+        alias_key = track, storefront
         if not force and key in self.cache:
             cached = self.cache[key]
             return cached, f"已匹配 · {cached.source} · {len(cached.lines)} 行（缓存）"
         if force:
-            self.alias_cache.pop(key, None)
+            self.alias_cache.pop(alias_key, None)
         self.cache.pop(key, None)
         try:
             self._check()
             base_aliases = aliases = [track]
-            preferred = (self._kugou, self._lrclib) if has_chinese(track.title + track.artist) else (self._lrclib, self._kugou)
-            providers = (*preferred, self._netease, self._qq)
+            providers = tuple(getattr(self, "_" + source) for source in order)
             result = self._run_stage(providers[0], aliases, budget=3.)
             if result is None:
                 aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
@@ -564,7 +566,7 @@ class LyricsFinder:
                 if expanded != aliases:
                     result = self._search_sources(expanded, providers, tolerance=2)
                     if result is not None:
-                        self.alias_cache[key] = expanded
+                        self.alias_cache[alias_key] = expanded
             self._check()
             if result:
                 if len(self.cache) >= 64:

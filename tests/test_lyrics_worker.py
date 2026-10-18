@@ -11,7 +11,7 @@ from moonlyrics.lyrics_worker import LyricsWorker
 
 
 class WorkerTests(TestCase):
-    def run_worker(self, finder, expected_results, delays=(.01, .02), after_result=None):
+    def run_worker(self, finder, expected_results, delays=(.01, .02), after_result=None, source_order=None):
         app = QCoreApplication.instance() or QCoreApplication([])
         results = []
         with patch("moonlyrics.lyrics_worker.LyricsFinder", return_value=finder):
@@ -24,7 +24,7 @@ class WorkerTests(TestCase):
             worker.result_ready.connect(receive)
             worker.start()
             try:
-                worker.request(1, Track("旧歌", "歌手", duration=100), "tr")
+                worker.request(1, Track("旧歌", "歌手", duration=100), "tr", source_order=source_order)
                 deadline = time.monotonic() + 2
                 while len(results) < expected_results and time.monotonic() < deadline:
                     QTest.qWait(10)
@@ -85,7 +85,7 @@ class WorkerTests(TestCase):
         document = Lyrics((LyricLine(1, "月光"),), "测试")
         finder = Mock()
 
-        def find(track, storefront, cancelled, force):
+        def find(track, storefront, cancelled, force, source_order):
             if track.title == "旧歌":
                 entered.set()
                 if not release.wait(1):
@@ -115,3 +115,24 @@ class WorkerTests(TestCase):
                 release.set(); worker.stop()
                 self.assertTrue(worker.wait(1000))
         finder.close.assert_called_once()
+
+    def test_retries_preserve_the_source_order_snapshot(self):
+        order = ["qq", "netease", "kugou", "lrclib"]
+        expected = tuple(order)
+        finder = Mock()
+        finder.find.side_effect = [(None, "暂未找到"), (Lyrics((LyricLine(1, "月光"),), "测试"), "已匹配")]
+        self.run_worker(finder, 2, source_order=order, after_result=lambda worker, result: order.reverse())
+        self.assertEqual([call.args[4] for call in finder.find.call_args_list], [expected, expected])
+
+    def test_changing_priority_interrupts_the_old_scheduled_retry(self):
+        new_order = ("netease", "qq", "kugou", "lrclib")
+        document = Lyrics((LyricLine(1, "月光"),), "网易云音乐")
+        finder = Mock()
+        finder.find.side_effect = lambda track, store, cancel, force, order: (document, "已匹配") if order == new_order else (None, "暂未找到")
+        def after_result(worker, result):
+            if result[0] == 1:
+                worker.request(2, Track("旧歌", "歌手", duration=100), "tr", True, new_order)
+        results = self.run_worker(finder, 2, delays=(10, 10), after_result=after_result)
+        self.assertEqual([result[0] for result in results], [1, 2])
+        self.assertIs(results[-1][1], document)
+        self.assertEqual(finder.find.call_count, 2)

@@ -1,4 +1,5 @@
 import html
+from itertools import permutations
 import time
 from unittest import TestCase
 from unittest.mock import Mock, patch
@@ -6,8 +7,54 @@ from unittest.mock import Mock, patch
 import requests
 
 from moonlyrics.lyrics import LyricsFinder, Lyrics, LyricLine, Track, match_rank, SearchCancelled
+from moonlyrics.styles import LYRIC_SOURCES
 
 LRC = "[00:01.20]月光落下\n[00:04.50]窗前等候"
+
+
+class SourcePriorityTests(TestCase):
+    def setUp(self):
+        self.finder = LyricsFinder()
+        self.addCleanup(self.finder.close)
+        self.track = Track("Moonlight", "Luna", duration=100)
+        self.finder._aliases = Mock(return_value=[self.track])
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+
+    def test_every_priority_order_falls_back_in_the_chosen_sequence(self):
+        for order in permutations(LYRIC_SOURCES):
+            calls = []
+            def search(source):
+                def run(*args, **kwargs):
+                    calls.append(source)
+                    return Lyrics((LyricLine(1, "月光"),), source) if source == order[-1] else None
+                return run
+            for source in LYRIC_SOURCES:
+                setattr(self.finder, "_" + source, Mock(side_effect=search(source)))
+            document, _ = self.finder.find(self.track, source_order=order)
+            self.assertIsNotNone(document)
+            self.assertEqual(calls, list(order))
+
+    def test_priority_changes_do_not_reuse_another_orders_cached_lyrics(self):
+        for source in LYRIC_SOURCES:
+            setattr(self.finder, "_" + source, Mock(return_value=Lyrics((LyricLine(1, "月光"),), source)))
+        first, _ = self.finder.find(self.track)
+        second, _ = self.finder.find(self.track, source_order=("qq", "netease", "kugou", "lrclib"))
+        again, _ = self.finder.find(self.track)
+        self.assertEqual((first.source, second.source, again.source), ("kugou", "qq", "kugou"))
+        self.finder._kugou.assert_called_once()
+        self.finder._qq.assert_called_once()
+
+    def test_first_source_is_rechecked_with_verified_names_before_fallback(self):
+        for source in LYRIC_SOURCES:
+            setattr(self.finder, "_" + source, Mock(return_value=None))
+        document = Lyrics((LyricLine(1, "月光"),), "QQ音乐")
+        self.finder._aliases.return_value = [self.track, Track("달빛", "루나", duration=100)]
+        self.finder._qq.side_effect = lambda aliases, **kwargs: document if len(aliases) > 1 else None
+        result, _ = self.finder.find(self.track, source_order=("qq", "netease", "kugou", "lrclib"))
+        self.assertIs(result, document)
+        self.assertEqual(self.finder._qq.call_count, 2)
+        for source in ("netease", "kugou", "lrclib"):
+            getattr(self.finder, "_" + source).assert_not_called()
 
 
 class RegionalMatchingTests(TestCase):

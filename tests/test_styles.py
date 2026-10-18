@@ -35,6 +35,14 @@ class StyleTests(unittest.TestCase):
         self.assertEqual(normalized(dict(lyric_offset_ms=-9000))["lyric_offset_ms"], -3000)
         self.assertEqual(normalized(dict(lyric_offset_ms=9000))["lyric_offset_ms"], 3000)
 
+    def test_lyric_source_order_is_saved_and_invalid_orders_use_defaults(self):
+        order = ("qq", "netease", "lrclib", "kugou")
+        settings = normalized(dict(lyric_source_order=order))
+        self.assertEqual(normalized(json.loads(json.dumps(settings)))["lyric_source_order"], order)
+        for invalid in (None, [], "qq", ["qq"] * 4, ["qq", "netease", "lrclib", "unknown"],
+                        ["qq", "netease", "lrclib", []]):
+            self.assertEqual(normalized(dict(lyric_source_order=invalid))["lyric_source_order"], DEFAULTS["lyric_source_order"])
+
 
 if __name__ == "__main__":
     unittest.main()

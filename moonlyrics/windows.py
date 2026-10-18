@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
                             QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
                             QSlider, QVBoxLayout, QWidget)
 
-from .styles import DEFAULTS, LIMITS, PRESETS, normalized, transparency_amount
+from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, normalized, transparency_amount
 from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
@@ -624,6 +624,22 @@ class Controls(QWidget):
         self.retry_lyrics = QPushButton("重新匹配"); self.retry_lyrics.setEnabled(False)
         self.retry_lyrics.clicked.connect(lambda: self.request_lyrics(force=True))
         lyric_row.addWidget(self.retry_lyrics); layout.addLayout(lyric_row)
+        source_row = QHBoxLayout(); source_row.setSpacing(4)
+        source_row.addWidget(QLabel("歌词源顺序"))
+        self.source_choices = []
+        for position, source in enumerate(settings["lyric_source_order"]):
+            if position:
+                source_row.addWidget(QLabel("→"))
+            choice = QComboBox()
+            for key, label in LYRIC_SOURCES.items():
+                choice.addItem(label, key)
+            choice.setCurrentIndex(choice.findData(source))
+            choice.setAccessibleName(f"第 {position + 1} 优先歌词源")
+            choice.setToolTip("按从左到右的顺序自动匹配，未找到时继续尝试下一家。\n选择已有来源会交换位置，并重新匹配当前歌曲。")
+            choice.currentIndexChanged.connect(lambda index, slot=position: self.source_order_changed(slot))
+            self.source_choices.append(choice)
+            source_row.addWidget(choice)
+        layout.addLayout(source_row)
         self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
         self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
         timing_row = QHBoxLayout(); timing_row.addWidget(QLabel("歌词校准"))
@@ -727,6 +743,18 @@ class Controls(QWidget):
         self.settings["storefront"] = self.storefront.currentData()
         self.request_lyrics(force=True)
 
+    def source_order_changed(self, position):
+        order = list(self.settings["lyric_source_order"])
+        selected = self.source_choices[position].currentData()
+        previous = order.index(selected)
+        order[previous], order[position] = order[position], selected
+        self.settings["lyric_source_order"] = tuple(order)
+        for choice, source in zip(self.source_choices, order):
+            blocked = choice.blockSignals(True)
+            choice.setCurrentIndex(choice.findData(source))
+            choice.blockSignals(blocked)
+        self.request_lyrics(force=True)
+
     def matching_key(self, snapshot):
         text = lambda value: " ".join(value.split()).casefold()
         identity = (snapshot.source, text(snapshot.title), text(snapshot.artist), text(snapshot.album), self.settings["storefront"])
@@ -751,7 +779,8 @@ class Controls(QWidget):
         self.lyrics_status.setText(("等待歌曲信息稳定…" if defer else "正在匹配歌词…") if valid else "等待完整的歌曲信息")
         track = Track(snapshot.title, snapshot.artist, snapshot.album, self.lyric_duration) if valid else None
         if self.lyrics_worker is not None:
-            self.lyrics_worker.request(self.lyric_request, None if defer else track, self.settings["storefront"], force)
+            self.lyrics_worker.request(self.lyric_request, None if defer else track, self.settings["storefront"], force,
+                                       self.settings["lyric_source_order"])
         if defer and valid:
             self.lyric_debounce.start(600)
 
@@ -1036,6 +1065,15 @@ def self_test(app, control, report_path, preview_path):
         assert control.media_progress.value() == round(64 / 270 * 1000)
         assert "月光轻轻落在窗台" in glass.view.primary_text
         result["playback_display"] = True
+        original_order = control.settings["lyric_source_order"]
+        control.source_choices[0].setCurrentIndex(control.source_choices[0].findData("qq"))
+        assert control.settings["lyric_source_order"][0] == "qq"
+        assert len(set(choice.currentData() for choice in control.source_choices)) == len(LYRIC_SOURCES)
+        assert normalized(json.loads(json.dumps(control.settings)))["lyric_source_order"] == control.settings["lyric_source_order"]
+        for choice, source in zip(control.source_choices, original_order):
+            choice.setCurrentIndex(choice.findData(source))
+        assert control.settings["lyric_source_order"] == original_order
+        result["source_priority_controls"] = True
         assert normalize("遠走高飛") == normalize("远走高飞")
         control.media_timer.stop()
         control.lyric_debounce.stop()

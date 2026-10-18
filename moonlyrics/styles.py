@@ -6,9 +6,18 @@ PRESETS = {
     "soft": dict(label="柔光", description="均匀的轻磨砂，保留柔和的明暗层次。", blur=20, refraction=4),
     "rich": dict(label="凝润", description="细腻的浓磨砂，让繁杂背景更安静。", blur=38, refraction=2),
 }
+LYRIC_SOURCES = {"kugou": "酷狗", "lrclib": "LRCLIB", "netease": "网易云", "qq": "QQ音乐"}
 DEFAULTS = dict(preset="soft", blur=PRESETS["soft"]["blur"], refraction=PRESETS["soft"]["refraction"],
-                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=0)
+                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=0,
+                lyric_source_order=tuple(LYRIC_SOURCES))
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
+
+
+def normalized_source_order(value):
+    if (isinstance(value, (list, tuple)) and len(value) == len(LYRIC_SOURCES)
+            and all(isinstance(item, str) for item in value) and set(value) == set(LYRIC_SOURCES)):
+        return tuple(value)
+    return tuple(LYRIC_SOURCES)
 
 
 def normalized(values):
@@ -27,6 +36,7 @@ def normalized(values):
         result["fps"] = int(values["fps"])
     if values.get("storefront") in ("tr", "cn", "hk", "tw", "us"):
         result["storefront"] = values["storefront"]
+    result["lyric_source_order"] = normalized_source_order(values.get("lyric_source_order"))
     preset = values.get("preset")
     if isinstance(preset, str) and preset in PRESETS:
         result["preset"] = preset
