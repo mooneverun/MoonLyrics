@@ -5,13 +5,18 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from moonlyrics.lyrics import Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track, match_rank, normalize, parse_lrc, related_artist_name
+from moonlyrics.lyrics import Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track, match_rank, normalize, parse_lrc, parse_synced_lrc, related_artist_name
 from moonlyrics.styles import DEFAULTS
 
 SAMPLE = "[00:01.00]窗前的月光\n[00:03.50]慢慢经过身旁\n[00:06.00]\n[00:08.00]下一句轻轻唱"
 
 
 class ParserTests(TestCase):
+    def test_synced_lyric_quality_rejects_placeholders_corrupt_offsets_and_outside_cues(self):
+        for text in ("[00:00.00]暂无歌词", "[10:00]A\n[11:00]B", "[offset:" + "9" * 400 + "]\n" + SAMPLE):
+            self.assertEqual(parse_synced_lrc(text, 100), ())
+        self.assertEqual(parse_synced_lrc(SAMPLE, 100), parse_lrc(SAMPLE))
+
     def test_timestamps_repeats_empty_cues_and_word_tags(self):
         lines = parse_lrc("[ti:test]\n[00:03.5][00:08.500]<00:03.500>月光\n[00:01.00]开头\n[00:06.00]")
         self.assertEqual([(x.time, x.text) for x in lines], [(1, "开头"), (3.5, "月光"), (6, ""), (8.5, "月光")])
@@ -51,6 +56,22 @@ class ParserTests(TestCase):
 
 
 class MatchingTests(TestCase):
+    def test_attached_and_nested_feature_credits_preserve_recording_versions(self):
+        for title in ("Moonlight (feat.Guest)", "Moonlight [ft.Guest]", "Moonlight (with Guest)"):
+            self.assertIsNotNone(match_rank(Track(title, "Luna", duration=100),
+                                           [Track("Moonlight", "Luna & Guest", duration=100)]))
+        nested = Track("Moonlight (feat. Guest (게스트))", "Luna", duration=100)
+        self.assertIsNotNone(match_rank(Track("Moonlight", "Luna & Guest (게스트)", duration=100), [nested]))
+        live = Track("Moonlight (Live) (feat. Guest)", "Luna", duration=100)
+        self.assertIsNotNone(match_rank(Track("Moonlight (feat.Guest) (Live)", "Luna", duration=100), [live]))
+        self.assertIsNone(match_rank(Track("Moonlight (feat.Guest)", "Luna", duration=100), [live]))
+
+    def test_verified_locale_can_supply_a_missing_feature_credit(self):
+        aliases = [Track("Moonlight", "Luna", duration=100),
+                   Track("달빛 (feat. 게스트)", "루나", duration=100)]
+        self.assertIsNotNone(match_rank(Track("Moonlight", "Luna & 게스트", duration=100), aliases))
+        self.assertIsNone(match_rank(Track("Moonlight", "Luna", duration=100), aliases))
+
     def test_collaborator_order_and_separators_do_not_change_the_recording(self):
         expected = Track("Moonlight", "Singer A & Singer B", duration=100)
         for artist in ("Singer B, Singer A", "Singer A feat. Singer B", "Singer A ＆ Singer B"):
@@ -84,6 +105,74 @@ class MatchingTests(TestCase):
 
 
 class FinderTests(TestCase):
+    def test_kugou_and_lrclib_skip_placeholder_candidates(self):
+        track = Track("月光", "歌手", duration=100)
+        self.finder.cancelled = lambda: False; self.finder.deadline = time.monotonic() + 20
+        bad = "[00:00.00]暂无歌词"
+        self.finder._json = Mock(side_effect=[dict(status=200, candidates=[dict(id=str(i), accesskey="test",
+            song=track.title, singer=track.artist, duration=100000) for i in (1, 2)]),
+            dict(content=base64.b64encode(bad.encode()).decode()), dict(content=base64.b64encode(SAMPLE.encode()).decode())])
+        self.assertEqual(len(self.finder._kugou([track]).lines), len(parse_lrc(SAMPLE)))
+        self.assertEqual(self.finder._json.call_args.kwargs["id"], "2")
+        self.finder._json = Mock(return_value=[dict(trackName=track.title, artistName=track.artist,
+            duration=100, syncedLyrics=text) for text in (bad, SAMPLE)])
+        self.assertEqual(len(self.finder._lrclib([track]).lines), len(parse_lrc(SAMPLE)))
+
+    def test_album_fallback_survives_an_initial_song_search_error(self):
+        track = Track("Moonlight", "Luna", "Album", 100)
+        vocal = self.apple_record(42, track.title, track.artist, 100000); vocal["collectionId"] = 50
+        self.finder._json = Mock(side_effect=[requests.ConnectionError("temporary"), dict(results=[vocal]),
+            dict(results=[vocal]), dict(results=[self.apple_record(42, "달빛", "루나", 100000)])])
+        self.finder.cancelled = lambda: False; self.finder.deadline = time.monotonic() + 20
+        self.assertEqual(self.finder._aliases(track, "tr")[1].title, "달빛")
+
+    def test_kugou_searches_without_feature_text_but_still_checks_all_people(self):
+        track = Track("Moonlight (feat. Guest)", "Luna", duration=100)
+        payload = base64.b64encode(SAMPLE.encode()).decode()
+        def response(url, **params):
+            if url.endswith("/download"):
+                return dict(content=payload)
+            return dict(status=200, candidates=[dict(id="good", accesskey="test", song="Moonlight",
+                singer="Luna & Guest", duration=100000)] if params.get("keyword") == "Luna - Moonlight" else [])
+        self.finder._json = Mock(side_effect=response)
+        self.finder.cancelled = lambda: False; self.finder.deadline = time.monotonic() + 20
+        self.assertIsNotNone(self.finder._kugou([track]))
+
+    def test_lrclib_searches_base_title_for_featured_recordings(self):
+        track = Track("Moonlight (feat. Guest)", "Luna", duration=100)
+        self.finder._json = Mock(side_effect=lambda url, **params: [dict(trackName="Moonlight",
+            artistName="Luna & Guest", duration=100, syncedLyrics=SAMPLE)] if params.get("track_name") == "Moonlight" else [])
+        self.finder.cancelled = lambda: False; self.finder.deadline = time.monotonic() + 20
+        self.assertIsNotNone(self.finder._lrclib([track]))
+
+    def test_partial_verified_names_survive_a_later_region_timeout(self):
+        track = Track("Moonlight", "Luna", duration=100)
+        document = Lyrics(parse_lrc(SAMPLE), "测试")
+        clock = [0.]
+        def response(url, **params):
+            if "search" in url:
+                return dict(results=[self.apple_record(42, "Moonlight", "Luna", 100000)])
+            if params.get("country") == "kr":
+                return dict(results=[self.apple_record(42, "Moonlit Night", "Luna", 100000)])
+            clock[0] = self.finder.stage_deadline + .01
+            self.finder._check()
+        self.finder._json = Mock(side_effect=response)
+        self.finder._kugou = Mock(side_effect=lambda aliases, **kwargs: document if len(aliases) > 1 else None)
+        self.finder._lrclib = Mock(return_value=None)
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        with patch("moonlyrics.lyrics.time.monotonic", side_effect=lambda: clock[0]):
+            found, _ = self.finder.find(track)
+        self.assertIs(found, document)
+
+    def test_chinese_aliases_do_not_prevent_checking_the_korean_locale(self):
+        track = Track("月光", "露娜", duration=100)
+        def response(url, **params):
+            title, artist = ("달빛", "루나") if params.get("country") == "kr" else (track.title, track.artist)
+            return dict(results=[self.apple_record(42, title, artist, 100000)])
+        self.finder._json = Mock(side_effect=response)
+        self.finder.cancelled = lambda: False; self.finder.deadline = time.monotonic() + 20
+        self.assertTrue(any(alias.title == "달빛" for alias in self.finder._aliases(track, "tr")))
+
     def test_bad_first_download_does_not_hide_a_valid_second_candidate(self):
         track = Track("月光", "歌手", duration=100)
         candidates = [dict(id=str(i), accesskey="test", song="月光", singer="歌手", duration=100000) for i in range(2)]

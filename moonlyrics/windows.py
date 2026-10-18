@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
                             QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
                             QSlider, QVBoxLayout, QWidget)
 
-from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, normalized, transparency_amount
+from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, normalized, transparency_amount, lyric_offset_seconds
 from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
@@ -647,11 +647,11 @@ class Controls(QWidget):
         reset_timing = QPushButton("重置")
         earlier.clicked.connect(lambda: self.change_lyric_offset(100))
         later.clicked.connect(lambda: self.change_lyric_offset(-100))
-        reset_timing.clicked.connect(lambda: self.change_lyric_offset(-self.settings["lyric_offset_ms"]))
+        reset_timing.clicked.connect(lambda: self.change_lyric_offset(DEFAULTS["lyric_offset_ms"] - self.settings["lyric_offset_ms"]))
         self.lyric_timing = QLabel(); self.lyric_timing.setMinimumWidth(80)
         self.lyric_timing.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lyric_timing.setText(self.offset_label())
-        self.lyric_timing.setToolTip("歌词慢了点提前，歌词快了点延后；只校准歌词，不改变歌曲播放进度。")
+        self.lyric_timing.setToolTip("所有来源默认提前 1 秒，按钮在此基础上微调；重置回到提前 1 秒。\n只校准歌词，不改变歌曲播放进度。")
         for widget in (earlier, self.lyric_timing, later, reset_timing): timing_row.addWidget(widget)
         layout.addLayout(timing_row)
         layout.addWidget(QLabel("玻璃风格"))
@@ -788,14 +788,15 @@ class Controls(QWidget):
         if self.closing or request_id != self.lyric_request:
             return
         self.lyrics_status.setText(message)
-        self.glass.view.set_lyrics(document, self.lyric_clock.position_at() + self.settings["lyric_offset_ms"] / 1000)
+        self.glass.view.set_lyrics(document, self.lyric_clock.position_at() + lyric_offset_seconds(self.settings))
         if document is not None:
             self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {document.source}")
         self.update_playback_display()
 
     def offset_label(self):
-        offset = self.settings["lyric_offset_ms"]
-        return f"{'提前' if offset > 0 else '延后'} {abs(offset) / 1000:.1f} 秒" if offset else "默认时序"
+        offset = lyric_offset_seconds(self.settings)
+        label = f"{'提前' if offset > 0 else '延后'} {abs(offset):.1f} 秒" if offset else "原始时序"
+        return label + "（默认）" if self.settings["lyric_offset_ms"] == DEFAULTS["lyric_offset_ms"] else label
 
     def change_lyric_offset(self, delta):
         lo, hi = LIMITS["lyric_offset_ms"]
@@ -810,7 +811,7 @@ class Controls(QWidget):
         timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
         self.media_status.setText(state); self.media_time.setText(timing)
         self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
-        self.glass.view.set_lyric_time(self.lyric_clock.position_at() + self.settings["lyric_offset_ms"] / 1000)
+        self.glass.view.set_lyric_time(self.lyric_clock.position_at() + lyric_offset_seconds(self.settings))
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
         secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else "播放音乐后显示歌曲与进度"
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
@@ -1077,6 +1078,8 @@ def self_test(app, control, report_path, preview_path):
         assert normalize("遠走高飛") == normalize("远走高飞")
         control.media_timer.stop()
         control.lyric_debounce.stop()
+        control.change_lyric_offset(DEFAULTS["lyric_offset_ms"] - control.settings["lyric_offset_ms"])
+        assert control.lyric_timing.text() == "提前 1.0 秒（默认）"
         document = Lyrics((LyricLine(60., "上面一行轻轻隐去"), LyricLine(64., "中间一行清晰显示"),
                            LyricLine(68., "下面一行渐渐出现"), LyricLine(72., "下一句等待时光")), "测试")
         control.lyric_request = 8
@@ -1094,7 +1097,7 @@ def self_test(app, control, report_path, preview_path):
         def playback_at(position, elapsed, status="playing"):
             with patch("time.perf_counter", return_value=base + elapsed):
                 control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
-                                                     album="播放信息测试", status=status, position=position,
+                                                     album="播放信息测试", status=status, position=position - 1,
                                                      duration=270., observed_at=base + elapsed))
                 scroll_samples.append(glass.view.scroll_position)
         for elapsed, position in ((0., 67.85), (.2, 68.05), (.25, 67.96), (.3, 68.03), (.35, 67.98), (.5, 68.12)):
@@ -1107,9 +1110,14 @@ def self_test(app, control, report_path, preview_path):
         playback_at(67.9, .8, "paused")
         assert glass.view.lyric_index == 1
         control.change_lyric_offset(100)
-        assert glass.view.lyric_index == 2 and control.lyric_timing.text() == "提前 0.1 秒"
+        assert glass.view.lyric_index == 2 and control.lyric_timing.text() == "提前 1.1 秒"
         control.change_lyric_offset(-100)
         assert glass.view.lyric_index == 1
+        control.change_lyric_offset(-1000)
+        assert control.lyric_timing.text() == "原始时序"
+        next(button for button in control.findChildren(QPushButton) if button.text() == "重置").click()
+        assert control.settings["lyric_offset_ms"] == 1000 and control.lyric_timing.text() == "提前 1.0 秒（默认）"
+        result["calibration_base_advance_seconds"] = lyric_offset_seconds(control.settings)
         playback_at(64.1, .9, "paused")
         QTest.qWait(100)
         control.update_playback_display()

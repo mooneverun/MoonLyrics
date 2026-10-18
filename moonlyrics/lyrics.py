@@ -19,6 +19,7 @@ LOG = logging.getLogger("moonlyrics.lyrics")
 _simplified, _traditional = OpenCC("t2s"), OpenCC("s2t")
 _stamp = re.compile(r"\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]")
 _word_stamp = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d+)?>")
+_feature = r"(?:feat(?:uring)?|ft)(?:\.\s*|\s+)"
 _remaster = re.compile(r"\s*[\[(（][^\])）]*(?:remaster|重制|重製)[^\])）]*[\])）]|\s*[-–—]\s*(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?", re.I)
 
 
@@ -42,11 +43,26 @@ def has_korean(text):
 
 def split_credit(text):
     text = _remaster.sub("", unicodedata.normalize("NFKC", str(text or ""))).strip()
-    for pattern in (r"\s*[\[(]\s*(?:feat(?:uring)?|ft)\.?\s+([^\])]+)[\])]\s*$",
-                    r"\s+(?:feat(?:uring)?|ft)\.?\s+(.+)$"):
-        match = re.search(pattern, text, re.I)
-        if match:
-            return text[:match.start()].strip(), match[1].strip()
+    match = re.search(r"\s*([\[(])\s*(?:" + _feature + r"|with\s+)", text, re.I)
+    if match:
+        brackets = {"(": ")", "[": "]"}
+        stack = [brackets[match[1]]]
+        for index in range(match.end(), len(text)):
+            char = text[index]
+            if char in brackets:
+                stack.append(brackets[char])
+            elif char in ")]":
+                if char != stack.pop():
+                    break
+                if not stack:
+                    guests = text[match.end():index].strip()
+                    if guests:
+                        return (text[:match.start()] + " " + text[index + 1:]).strip(), guests
+                    break
+        return text, ""
+    match = re.search(r"\s+" + _feature + r"(.+)$", text, re.I)
+    if match:
+        return text[:match.start()].strip(), match[1].strip()
     return text, ""
 
 
@@ -63,7 +79,7 @@ def bilingual_parts(text):
 
 def artist_parts(value, *, affiliations=False):
     parts = []
-    for part in re.split(r"\s*(?:[,&、，;；]|\b(?:feat(?:uring)?|ft)\.?\s+)\s*",
+    for part in re.split(r"\s*(?:[,&、，;；]|\b" + _feature + r")\s*",
                          unicodedata.normalize("NFKC", value), flags=re.I):
         keys = {normalize(name) for name in (part, *bilingual_parts(part)) if normalize(name)}
         if affiliations:
@@ -95,7 +111,7 @@ def recording_rosters(aliases):
     """Verified recording locales may translate the lead and guest blocks independently."""
     if not aliases:
         return []
-    count = len(artist_parts(aliases[0].artist + " & " + split_credit(aliases[0].title)[1]))
+    count = max(len(artist_parts(alias.artist + " & " + split_credit(alias.title)[1])) for alias in aliases)
     rosters = []
     for lead in aliases:
         for guest in aliases:
@@ -180,6 +196,16 @@ def parse_lrc(text):
     return lines if any(line.text for line in lines) else ()
 
 
+def parse_synced_lrc(text, duration):
+    """A single timestamped placeholder must not hide another source's real lyrics."""
+    try:
+        lines = parse_lrc(text)
+    except (ValueError, OverflowError):
+        return ()
+    usable = [line for line in lines if line.text and (duration <= 0 or line.time <= duration + 5)]
+    return lines if len(usable) >= 2 else ()
+
+
 def metadata_rank(candidate, aliases, tolerance=5):
     """Prequalify the recording before spending requests on performer identities."""
     ranks = []
@@ -224,6 +250,7 @@ class LyricsFinder:
         self.cache = {}
         self.alias_cache = {}
         self.artist_cache = {}
+        self.artist_round_cache = {}
         self.profile_requests = 0
         self.stage_deadline = None
         self.failures = set()
@@ -297,11 +324,15 @@ class LyricsFinder:
             return self.alias_cache[key]
         aliases = [track]
         try:
-            payload = self._json("https://itunes.apple.com/search", term=f"{track.title} {track.artist}",
-                                 country=storefront, entity="song", limit=25)
+            try:
+                payload = self._json("https://itunes.apple.com/search", term=f"{track.title} {track.artist}",
+                                     country=storefront, entity="song", limit=25)
+            except (requests.RequestException, ValueError, TypeError, KeyError):
+                self.failures.add("Apple song search")
+                payload = dict(results=[])
             if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
                 self.failures.add("Apple")
-                return aliases
+                payload = dict(results=[])
             matches = [(match_rank(candidate, [track]), identifier, candidate)
                        for identifier, candidate in self._apple_tracks(payload)]
             matches = [item for item in matches if item[0] is not None and item[1]]
@@ -340,32 +371,35 @@ class LyricsFinder:
             if matches:
                 _, identifier, original = min(matches, key=lambda item: item[0])
                 chinese = has_chinese(track.title + track.artist + track.album)
+                checked_korean = False
                 for country in (("hk", "tw", "kr") if chinese else ("kr", "hk", "tw")):
+                    if country == "tw" and any(has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
+                        continue
+                    checked_korean |= country == "kr"
                     try:
                         localized = self._json("https://itunes.apple.com/lookup", id=identifier, country=country, entity="song")
                         if not isinstance(localized, dict) or not isinstance(localized.get("results"), list):
                             self.failures.add("Apple localized names")
                             continue
                         for found_id, candidate in self._apple_tracks(localized):
-                            if found_id != identifier or abs(candidate.duration - original.duration) > 1:
+                            if (found_id != identifier or not candidate.title or not candidate.artist
+                                    or abs(candidate.duration - original.duration) > 1):
                                 continue
                             if not any(normalize(candidate.title) == normalize(alias.title)
                                        and normalize(candidate.artist) == normalize(alias.artist) for alias in aliases):
                                 aliases.append(candidate)
+                                if key not in self.alias_cache and len(self.alias_cache) >= 64:
+                                    self.alias_cache.pop(next(iter(self.alias_cache)))
+                                self.alias_cache[key] = aliases
                     except (requests.RequestException, ValueError, TypeError, KeyError) as error:
                         self.failures.add("Apple localized names")
                         LOG.info("Localized name lookup failed: country=%s error=%s", country, type(error).__name__)
                     if any(has_korean(alias.title + alias.artist)
-                           or has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
+                           or checked_korean and has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
         except (requests.RequestException, ValueError, TypeError, KeyError):
             LOG.debug("Apple localized name lookup unavailable", exc_info=True)
         self._check()
-        # An unavailable or empty lookup must not become a sticky negative cache.
-        if len(aliases) > 1:
-            if len(self.alias_cache) >= 64:
-                self.alias_cache.pop(next(iter(self.alias_cache)))
-            self.alias_cache[key] = aliases
         return aliases
 
     def _catalog_aliases(self, aliases):
@@ -413,8 +447,9 @@ class LyricsFinder:
         return expanded
 
     def _kugou(self, aliases, tolerance=5):
-        queries = list(dict.fromkeys(_simplified.convert(f"{t.artist} - {t.title}").strip() for t in reversed(aliases)))
-        for query in queries[:2]:
+        queries = list(dict.fromkeys(_simplified.convert(f"{t.artist} - {title}").strip() for t in reversed(aliases)
+                                    for title in (split_credit(t.title)[0], t.title)))
+        for query in queries[:4]:
             try:
                 data = self._json("https://lyrics.kugou.com/search", ver=1, man="yes", client="pc", keyword=query,
                                   duration=round(aliases[0].duration * 1000))
@@ -444,7 +479,7 @@ class LyricsFinder:
                             self.failures.add("KuGou download")
                             continue
                         raw = base64.b64decode(payload.get("content", ""), validate=True).decode("utf-8-sig")
-                        lines = parse_lrc(raw)
+                        lines = parse_synced_lrc(raw, candidate.duration)
                         if lines:
                             return Lyrics(lines, "酷狗", candidate.title, candidate.artist)
                     except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError) as error:
@@ -456,12 +491,17 @@ class LyricsFinder:
 
     def _lrclib(self, aliases, tolerance=5):
         queries = []
-        for track in reversed(aliases):
+        for track in aliases:
+            title = split_credit(track.title)[0]
+            if not has_chinese(title):
+                queries.append((title, track.artist))
+            queries.append((title, None))
+        for track in aliases:
             for title in (track.title, _simplified.convert(track.title), _traditional.convert(track.title)):
                 if not has_chinese(title):
                     queries.append((title, track.artist))
                 queries.append((title, None))
-        for title, artist in list(dict.fromkeys(queries))[:4]:
+        for title, artist in list(dict.fromkeys(queries))[:6]:
             try:
                 params = dict(track_name=title)
                 if artist is not None:
@@ -473,7 +513,7 @@ class LyricsFinder:
                 self.reachable = True
                 matches = []
                 for item in data[:200]:
-                    if not isinstance(item, dict) or not item.get("syncedLyrics"):
+                    if not isinstance(item, dict) or not item.get("syncedLyrics") or item.get("instrumental") is True:
                         continue
                     candidate = Track(str(item.get("trackName") or ""), str(item.get("artistName") or ""),
                                       str(item.get("albumName") or ""), finite(item.get("duration")))
@@ -482,7 +522,7 @@ class LyricsFinder:
                         matches.append((rank, item, candidate))
                 LOG.info("Lyric search: provider=LRCLIB candidates=%s accepted=%s", len(data), len(matches))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0]):
-                    lines = parse_lrc(item["syncedLyrics"])
+                    lines = parse_synced_lrc(item["syncedLyrics"], candidate.duration)
                     if lines:
                         return Lyrics(lines, "LRCLIB", candidate.title, candidate.artist)
             except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -491,8 +531,9 @@ class LyricsFinder:
 
     @staticmethod
     def _search_queries(aliases):
-        return list(dict.fromkeys(_simplified.convert(f"{track.artist} {split_credit(track.title)[0]}").strip()
-                                  for track in aliases))[:3]
+        queries = [_simplified.convert(f"{track.artist} {split_credit(track.title)[0]}").strip() for track in aliases]
+        titles = [_simplified.convert(split_credit(track.title)[0]).strip() for track in aliases]
+        return list(dict.fromkeys(queries[:3] + titles[:3]))
 
     @staticmethod
     def _artist_id(provider, record):
@@ -508,9 +549,10 @@ class LyricsFinder:
             return None
         key = provider, identifier
         anchor = {normalize(name) for name in (record["name"], *bilingual_parts(record["name"]))}
-        if key in self.artist_cache:
-            names = self.artist_cache[key]
-            return names if names & anchor else None
+        if key in self.artist_cache or key in self.artist_round_cache:
+            names = self.artist_cache.get(key, self.artist_round_cache.get(key))
+            if names & anchor:
+                return names
         if self.profile_requests >= 6:
             self.failures.add("Artist profile budget")
             return None
@@ -555,11 +597,14 @@ class LyricsFinder:
                 names.update(normalize(name) for name in (value, *bilingual_parts(value)) if normalize(name))
             if not names & anchor:
                 raise ValueError("Artist name does not anchor to the search result")
-            if len(self.artist_cache) >= 256:
-                self.artist_cache.pop(next(iter(self.artist_cache)))
-            self.artist_cache[key] = frozenset(names)
+            names = frozenset(names)
+            self.artist_round_cache[key] = names
+            if names - anchor:
+                if len(self.artist_cache) >= 256:
+                    self.artist_cache.pop(next(iter(self.artist_cache)))
+                self.artist_cache[key] = names
             LOG.info("Artist aliases verified: provider=%s artist_id=%s names=%s", provider, identifier, len(names))
-            return self.artist_cache[key]
+            return names
         except (requests.RequestException, ValueError, TypeError, KeyError) as error:
             self.failures.add(provider + " artist profile")
             LOG.info("Artist profile unavailable: provider=%s error=%s", provider, type(error).__name__)
@@ -644,7 +689,8 @@ class LyricsFinder:
                             self.failures.add("网易云音乐歌词")
                             continue
                         lrc = payload.get("lrc")
-                        lines = parse_lrc(html.unescape(lrc.get("lyric") or "")) if isinstance(lrc, dict) else ()
+                        lines = (parse_synced_lrc(html.unescape(lrc.get("lyric") or ""), candidate.duration)
+                                 if isinstance(lrc, dict) and not payload.get("nolyric") else ())
                         if lines:
                             return Lyrics(lines, "网易云音乐", candidate.title, candidate.artist)
                     except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -696,7 +742,7 @@ class LyricsFinder:
                         if not isinstance(payload, dict) or payload.get("code") != 0:
                             self.failures.add("QQ音乐歌词")
                             continue
-                        lines = parse_lrc(html.unescape(payload.get("lyric") or ""))
+                        lines = parse_synced_lrc(html.unescape(payload.get("lyric") or ""), candidate.duration)
                         if lines:
                             return Lyrics(lines, "QQ音乐", candidate.title, candidate.artist)
                     except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -718,6 +764,7 @@ class LyricsFinder:
         self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
         self.failures = set()
         self.profile_requests = 0
+        self.artist_round_cache.clear()
         self._check()
         order = normalized_source_order(source_order)
         key = track, storefront, order
@@ -727,6 +774,7 @@ class LyricsFinder:
             return cached, f"已匹配 · {cached.source} · {len(cached.lines)} 行（缓存）"
         if force:
             self.alias_cache.pop(alias_key, None)
+            self.artist_cache.clear()
         self.cache.pop(key, None)
         try:
             self._check()
@@ -734,7 +782,7 @@ class LyricsFinder:
             providers = tuple(getattr(self, "_" + source) for source in order)
             result = self._run_stage(providers[0], aliases, budget=3.)
             if result is None:
-                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or aliases
+                aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or self.alias_cache.get(alias_key, aliases)
                 result = self._search_sources(aliases, providers if aliases != base_aliases else providers[1:], reserve=2.)
             if result is None:
                 expanded = self._run_stage(self._catalog_aliases, aliases, budget=2.) or aliases

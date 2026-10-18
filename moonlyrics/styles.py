@@ -8,7 +8,7 @@ PRESETS = {
 }
 LYRIC_SOURCES = {"kugou": "酷狗", "lrclib": "LRCLIB", "netease": "网易云", "qq": "QQ音乐"}
 DEFAULTS = dict(preset="soft", blur=PRESETS["soft"]["blur"], refraction=PRESETS["soft"]["refraction"],
-                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=0,
+                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=1000, lyric_timing_version=1,
                 lyric_source_order=tuple(LYRIC_SOURCES))
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
 
@@ -28,6 +28,9 @@ def normalized(values):
         value = values.get(key, result[key])
         if isinstance(value, (int, float)) and math.isfinite(value):
             result[key] = max(lo, min(hi, int(value)))
+    # Upgrade the old zero default once; preserve manual values and an explicit new zero.
+    if values.get("lyric_timing_version") != 1 and values.get("lyric_offset_ms") == 0:
+        result["lyric_offset_ms"] = DEFAULTS["lyric_offset_ms"]
     if "transparency_level" not in values:
         previous = values.get("transparency")
         if isinstance(previous, (int, float)) and math.isfinite(previous):
@@ -48,5 +51,10 @@ def normalized(values):
 def transparency_amount(level):
     """Keep the former 90–100% endpoints while presenting a 1–10 scale."""
     return .9 + (level - 1) / 90
+
+
+def lyric_offset_seconds(settings):
+    """Every provider uses the same calibrated playback offset."""
+    return settings["lyric_offset_ms"] / 1000
 
 

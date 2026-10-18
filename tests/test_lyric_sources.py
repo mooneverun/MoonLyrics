@@ -13,6 +13,26 @@ LRC = "[00:01.20]月光落下\n[00:04.50]窗前等候"
 
 
 class ArtistIdentityTests(TestCase):
+    def test_incomplete_profile_does_not_poison_the_next_automatic_attempt(self):
+        track = Track("Moonlight", "달게스트", duration=100)
+        incomplete = dict(code=200, artist=dict(id=12, name="合作歌手", alias=[], transNames=[]))
+        profiles = iter([incomplete, self.profile()])
+        def response(url, **params):
+            if "/api/artist/" in url:
+                return next(profiles)
+            if "song/lyric" in url:
+                return dict(code=200, lrc=dict(lyric=LRC))
+            return dict(code=200, result=dict(songs=[dict(id=21, name="Moonlight", duration=100000,
+                artists=[dict(id=12, name="合作歌手")], album=dict(name="Album"))]))
+        self.finder._json = Mock(side_effect=response)
+        self.finder._aliases = Mock(return_value=[track]); self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        for source in ("qq", "lrclib", "kugou"):
+            setattr(self.finder, "_" + source, Mock(return_value=None))
+        first, _ = self.finder.find(track, source_order=("netease", "qq", "lrclib", "kugou"))
+        second, _ = self.finder.find(track, source_order=("netease", "qq", "lrclib", "kugou"))
+        self.assertIsNone(first)
+        self.assertIsNotNone(second)
+
     def setUp(self):
         self.finder = LyricsFinder()
         self.finder.cancelled = lambda: False
@@ -107,6 +127,12 @@ class ArtistIdentityTests(TestCase):
         names = self.finder._artist_profile("netease", record)
         self.assertTrue(names)
         self.assertEqual(self.finder._artist_profile("netease", record), names)
+        self.assertEqual(self.finder._json.call_count, 2)
+
+    def test_a_new_catalogue_name_for_a_cached_id_is_revalidated(self):
+        self.finder._json = Mock(side_effect=[self.profile(), self.profile(name="New Name")])
+        self.finder._artist_profile("netease", dict(id=12, name="合作歌手"))
+        self.assertTrue(self.finder._artist_profile("netease", dict(id=12, name="New Name")))
         self.assertEqual(self.finder._json.call_count, 2)
 
     def test_missing_or_extra_people_and_distinct_ids_with_the_same_name_are_rejected(self):
@@ -269,6 +295,29 @@ class RegionalMatchingTests(TestCase):
 
 
 class AnonymousSourceTests(TestCase):
+    def test_title_only_fallback_uses_artist_profiles_and_keeps_the_roster_check(self):
+        track = Track("Moonlight", "Luna", duration=100)
+        for source in ("netease", "qq"):
+            def response(url, **params):
+                if "/artist/" in url:
+                    return dict(code=200, artist=dict(id=12, name="露娜", alias=["Luna"]))
+                if "song/lyric" in url:
+                    return dict(code=200, lrc=dict(lyric=LRC))
+                if "search/get" in url:
+                    return dict(code=200, result=dict(songs=[dict(id=21, name="Moonlight", duration=100000,
+                        artists=[dict(id=12, name="露娜")], album=dict(name="Album"))] if params["s"] == "Moonlight" else []))
+                if "musicu.fcg" in url:
+                    request = params["body"]["req"]
+                    if request["method"] == "GetSingerDetail":
+                        return {"code": 0, "req": {"code": 0, "data": {"singer_list": [dict(
+                            basic_info=dict(singer_mid="guestmid", name="Luna (露娜)"), ex_info={})]}}}
+                    songs = [dict(mid="songmid", name="Moonlight", interval=100, album=dict(name="Album"),
+                                  singer=[dict(mid="guestmid", name="露娜")])] if request["param"]["query"] == "Moonlight" else []
+                    return {"code": 0, "req": {"code": 0, "data": {"body": {"song": {"list": songs}}}}}
+                return dict(code=0, lyric=LRC)
+            self.finder._json = Mock(side_effect=response)
+            self.assertIsNotNone(getattr(self.finder, "_" + source)([track]))
+
     def setUp(self):
         self.finder = LyricsFinder()
         self.finder.cancelled = lambda: False
@@ -308,8 +357,9 @@ class AnonymousSourceTests(TestCase):
         self.assertEqual(self.finder._json.call_args.kwargs["id"], 2)
 
     def test_netease_plain_text_is_not_treated_as_synced_lyrics(self):
-        self.finder._json = Mock(side_effect=[dict(code=200, result=dict(songs=[self.netease_song()])),
-                                             dict(code=200, lrc=dict(lyric="只有纯文本"))])
+        self.finder._json = Mock(side_effect=lambda url, **params:
+            dict(code=200, result=dict(songs=[self.netease_song()])) if "search/get" in url
+            else dict(code=200, lrc=dict(lyric="只有纯文本")))
         self.assertIsNone(self.finder._netease([self.track]))
 
     def test_qq_anonymous_search_and_html_encoded_lrc(self):
@@ -364,8 +414,23 @@ class AnonymousSourceTests(TestCase):
 
     def test_qq_plain_text_is_not_treated_as_synced_lyrics(self):
         search = dict(code=0, req=dict(code=0, data=dict(body=dict(song=dict(list=[self.qq_song()])))))
-        self.finder._json = Mock(side_effect=[search, dict(code=0, lyric="只有纯文本")])
+        self.finder._json = Mock(side_effect=lambda url, **params: search if "musicu.fcg" in url else dict(code=0, lyric="只有纯文本"))
         self.assertIsNone(self.finder._qq([self.track]))
+
+    def test_timestamped_placeholders_do_not_hide_the_next_download(self):
+        for source in ("netease", "qq"):
+            if source == "netease":
+                search = dict(code=200, result=dict(songs=[self.netease_song(1), self.netease_song(2)]))
+                bad = dict(code=200, lrc=dict(lyric="[00:00.00]暂无歌词"))
+                good = dict(code=200, lrc=dict(lyric=LRC))
+            else:
+                search = dict(code=0, req=dict(code=0, data=dict(body=dict(song=dict(list=[
+                    self.qq_song("first"), self.qq_song("second")])))))
+                bad = dict(code=0, lyric="[00:00.00]暂无歌词"); good = dict(code=0, lyric=LRC)
+            self.finder._json = Mock(side_effect=[search, bad, good])
+            self.assertEqual(len(getattr(self.finder, "_" + source)([self.track]).lines), 2)
+            params = self.finder._json.call_args.kwargs
+            self.assertEqual(params.get("id") if source == "netease" else params.get("songmid"), 2 if source == "netease" else "second")
 
     def test_exact_album_is_preferred_in_new_source_candidates(self):
         other, exact = self.netease_song(1), self.netease_song(2)
