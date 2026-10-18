@@ -29,6 +29,12 @@ class StyleTests(unittest.TestCase):
         result = normalized(dict(transparency_level=100, width=-1, height=1000))
         self.assertEqual((result["transparency_level"], result["width"], result["height"]), (10, 320, 240))
 
+    def test_lyric_calibration_is_preserved_and_bounded(self):
+        self.assertEqual(normalized({})["lyric_offset_ms"], 0)
+        self.assertEqual(normalized(dict(lyric_offset_ms=300))["lyric_offset_ms"], 300)
+        self.assertEqual(normalized(dict(lyric_offset_ms=-9000))["lyric_offset_ms"], -3000)
+        self.assertEqual(normalized(dict(lyric_offset_ms=9000))["lyric_offset_ms"], 3000)
+
 
 if __name__ == "__main__":
     unittest.main()

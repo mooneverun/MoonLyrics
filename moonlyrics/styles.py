@@ -7,8 +7,8 @@ PRESETS = {
     "rich": dict(label="凝润", description="细腻的浓磨砂，让繁杂背景更安静。", blur=38, refraction=2),
 }
 DEFAULTS = dict(preset="soft", blur=PRESETS["soft"]["blur"], refraction=PRESETS["soft"]["refraction"],
-                transparency_level=1, width=583, height=80, fps=30, storefront="tr")
-LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240))
+                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=0)
+LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
 
 
 def normalized(values):

@@ -54,6 +54,37 @@ class PlaybackSnapshot:
         return max(0., min(position, self.duration) if self.duration else position)
 
 
+class LyricClock:
+    """Absorb small media-clock corrections without rewinding the lyrics."""
+    def __init__(self):
+        self.snapshot = None
+        self.anchor = self.observed_at = self.correction = 0.
+
+    def update(self, snapshot, now=None):
+        now = time.perf_counter() if now is None else now
+        previous = self.snapshot
+        estimated, target = self.position_at(now), snapshot.position_at(now)
+        identity = lambda s: (s.source, s.title, s.artist, s.album)
+        reset = (previous is None or identity(previous) != identity(snapshot)
+                 or previous.status != snapshot.status or previous.rate != snapshot.rate
+                 or snapshot.status != "playing" or abs(target - estimated) > 1.)
+        self.snapshot, self.observed_at = snapshot, now
+        self.anchor = target if reset else estimated
+        self.correction = target - self.anchor
+
+    def position_at(self, now=None):
+        if self.snapshot is None:
+            return 0.
+        now = time.perf_counter() if now is None else now
+        position = self.anchor
+        if self.snapshot.status == "playing" and self.snapshot.title:
+            elapsed = min(3., max(0., now - self.observed_at)) * self.snapshot.rate
+            # Slew at up to 15% of playback speed; a small correction never runs backwards.
+            position += elapsed + max(-elapsed * .15, min(elapsed * .15, self.correction))
+        duration = self.snapshot.duration
+        return max(0., min(position, duration) if duration else position)
+
+
 def format_time(seconds):
     seconds = int(max(0., finite(seconds)))
     hours, seconds = divmod(seconds, 3600)

@@ -1,4 +1,4 @@
-"""MoonLyrics Windows glass prototype; music integration is not connected yet."""
+"""MoonLyrics Windows desktop glass, playback integration and synchronized lyrics."""
 import argparse
 import ctypes as C
 from ctypes import wintypes as W
@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
                             QSlider, QVBoxLayout, QWidget)
 
 from .styles import DEFAULTS, LIMITS, PRESETS, normalized, transparency_amount
-from .playback import PlaybackSnapshot, STATUS_LABELS, format_time
+from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
 from .lyrics_worker import LyricsWorker
@@ -249,10 +249,6 @@ class GlassView(QOpenGLWidget):
         self.scroll_position = -1.
         self.lyric_index = -1
         self.lyric_image_key = None
-        self.lyric_animation = QVariantAnimation(self)
-        self.lyric_animation.setDuration(280)
-        self.lyric_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.lyric_animation.valueChanged.connect(self.animate_lyric)
         self.dark_text = False
         self.renderer = "正在初始化显卡…"
         self.light = QVector2D(-.7, .8)
@@ -280,32 +276,19 @@ class GlassView(QOpenGLWidget):
         self.frames += 1
 
     def set_lyrics(self, document, position=0.):
-        self.lyric_animation.stop()
         self.lyrics = document
         self.lyric_index = document.index_at(position) if document else -1
-        self.scroll_position = float(self.lyric_index)
+        self.scroll_position = document.scroll_at(position) if document else -1.
         self.lyric_image_key = None
         self.update()
 
-    def animate_lyric(self, value):
-        self.scroll_position = float(value)
-        self.update()
-
-    def set_lyric_time(self, position, playing, jump=False):
+    def set_lyric_time(self, position):
         if self.lyrics is None:
             return
-        index = self.lyrics.index_at(position)
-        if jump or not playing or abs(index - self.lyric_index) > 1:
-            self.lyric_animation.stop()
-            self.lyric_index = index
-            if self.scroll_position != float(index):
-                self.scroll_position = float(index); self.update()
-        elif index != self.lyric_index:
-            self.lyric_animation.stop()
-            self.lyric_index = index
-            self.lyric_animation.setStartValue(self.scroll_position)
-            self.lyric_animation.setEndValue(float(index))
-            self.lyric_animation.start()
+        self.lyric_index = self.lyrics.index_at(position)
+        scroll = self.lyrics.scroll_at(position)
+        if abs(scroll - self.scroll_position) > 1e-7:
+            self.scroll_position = scroll; self.update()
 
     def initializeGL(self):
         try:
@@ -490,7 +473,6 @@ class GlassView(QOpenGLWidget):
 
     def shutdown(self):
         self.transparency_animation.stop()
-        self.lyric_animation.stop()
         if not self.ready:
             return
         self.makeCurrent()
@@ -597,11 +579,11 @@ class Controls(QWidget):
         self.samples = []
         self.sliders = {}
         self.playback = PlaybackSnapshot()
+        self.lyric_clock = LyricClock()
         self.media_reader = None
         self.lyrics_worker = None
         self.lyric_request = 0
         self.lyric_key = None
-        self.last_lyric_position = 0.
         self.closing = False
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
         self.setMinimumWidth(470)
@@ -640,6 +622,18 @@ class Controls(QWidget):
         lyric_row.addWidget(self.retry_lyrics); layout.addLayout(lyric_row)
         self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
         self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
+        timing_row = QHBoxLayout(); timing_row.addWidget(QLabel("歌词校准"))
+        earlier = QPushButton("提前 0.1 秒"); later = QPushButton("延后 0.1 秒")
+        reset_timing = QPushButton("重置")
+        earlier.clicked.connect(lambda: self.change_lyric_offset(100))
+        later.clicked.connect(lambda: self.change_lyric_offset(-100))
+        reset_timing.clicked.connect(lambda: self.change_lyric_offset(-self.settings["lyric_offset_ms"]))
+        self.lyric_timing = QLabel(); self.lyric_timing.setMinimumWidth(80)
+        self.lyric_timing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lyric_timing.setText(self.offset_label())
+        self.lyric_timing.setToolTip("歌词慢了点提前，歌词快了点延后；只校准歌词，不改变歌曲播放进度。")
+        for widget in (earlier, self.lyric_timing, later, reset_timing): timing_row.addWidget(widget)
+        layout.addLayout(timing_row)
         layout.addWidget(QLabel("玻璃风格"))
         preset_row = QHBoxLayout()
         self.preset_group = QButtonGroup(self)
@@ -701,7 +695,8 @@ class Controls(QWidget):
         self.adjustSize()
         self.move(screen.left() + 40, max(screen.top() + 20, screen.bottom() - self.height() - 30))
         self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
-        self.media_timer.start(100)
+        self.media_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.media_timer.start(33)
         if media:
             self.lyrics_worker = LyricsWorker(self)
             self.lyrics_worker.result_ready.connect(self.accept_lyrics)
@@ -714,6 +709,7 @@ class Controls(QWidget):
         if self.closing:
             return
         self.playback = snapshot
+        self.lyric_clock.update(snapshot)
         self.track_title.setText(snapshot.title or "等待 Apple Music")
         self.track_details.setText(" · ".join(value for value in (snapshot.artist, snapshot.album) if value)
                                    or "打开 Apple Music 并播放一首歌曲")
@@ -746,9 +742,19 @@ class Controls(QWidget):
         if self.closing or request_id != self.lyric_request:
             return
         self.lyrics_status.setText(message)
-        self.glass.view.set_lyrics(document, self.playback.position_at())
+        self.glass.view.set_lyrics(document, self.lyric_clock.position_at() + self.settings["lyric_offset_ms"] / 1000)
         if document is not None:
             self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {document.source}")
+        self.update_playback_display()
+
+    def offset_label(self):
+        offset = self.settings["lyric_offset_ms"]
+        return f"{'提前' if offset > 0 else '延后'} {abs(offset) / 1000:.1f} 秒" if offset else "默认时序"
+
+    def change_lyric_offset(self, delta):
+        lo, hi = LIMITS["lyric_offset_ms"]
+        self.settings["lyric_offset_ms"] = max(lo, min(hi, self.settings["lyric_offset_ms"] + delta))
+        self.lyric_timing.setText(self.offset_label())
         self.update_playback_display()
 
     def update_playback_display(self):
@@ -758,8 +764,7 @@ class Controls(QWidget):
         timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
         self.media_status.setText(state); self.media_time.setText(timing)
         self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
-        self.glass.view.set_lyric_time(position, snapshot.status == "playing", abs(position - self.last_lyric_position) > 1.5)
-        self.last_lyric_position = position
+        self.glass.view.set_lyric_time(self.lyric_clock.position_at() + self.settings["lyric_offset_ms"] / 1000)
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
         secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else "播放音乐后显示歌曲与进度"
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
@@ -1022,15 +1027,35 @@ def self_test(app, control, report_path, preview_path):
         assert glass.view.lyrics is None, "An old song replaced the current lyrics"
         control.accept_lyrics(8, document, "已匹配 · 测试")
         assert glass.view.lyric_index == 1
-        glass.view.set_lyric_time(68.1, True)
-        # Advance deterministically: desktop capture can delay the GUI event loop.
-        glass.view.lyric_animation.setCurrentTime(100)
-        assert 1 < glass.view.scroll_position < 2, "Lyric movement is not animated"
-        QTest.qWait(300)
+        glass.view.set_lyric_time(67.725)
+        assert abs(glass.view.scroll_position - 1.5) < 1e-7, "Lyric movement did not ease in before the cue"
+        glass.view.set_lyric_time(68.)
         assert glass.view.scroll_position == 2.
-        glass.view.set_lyric_time(60.1, True, jump=True)
-        assert glass.view.scroll_position == 0., "Seek did not reset the visible lyric"
-        glass.view.set_lyric_time(64.1, False)
+        from unittest.mock import patch
+        base = time.perf_counter()
+        scroll_samples = []
+        def playback_at(position, elapsed, status="playing"):
+            with patch("time.perf_counter", return_value=base + elapsed):
+                control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
+                                                     album="播放信息测试", status=status, position=position,
+                                                     duration=270., observed_at=base + elapsed))
+                scroll_samples.append(glass.view.scroll_position)
+        for elapsed, position in ((0., 67.85), (.2, 68.05), (.25, 67.96), (.3, 68.03), (.35, 67.98), (.5, 68.12)):
+            playback_at(position, elapsed)
+        assert all(b >= a for a, b in zip(scroll_samples, scroll_samples[1:])), scroll_samples
+        playback_at(72.1, .6)
+        assert glass.view.scroll_position == 3., "Forward seek did not reset the visible lyric"
+        playback_at(60.1, .7)
+        assert glass.view.scroll_position == 0., "Backward seek did not reset the visible lyric"
+        playback_at(67.9, .8, "paused")
+        assert glass.view.lyric_index == 1
+        control.change_lyric_offset(100)
+        assert glass.view.lyric_index == 2 and control.lyric_timing.text() == "提前 0.1 秒"
+        control.change_lyric_offset(-100)
+        assert glass.view.lyric_index == 1
+        playback_at(64.1, .9, "paused")
+        QTest.qWait(100)
+        control.update_playback_display()
         assert glass.view.scroll_position == 1.
         layer = lyric_layer(document, 1., glass.width(), glass.height(), glass.devicePixelRatioF(), False)
         rgba = layer.convertToFormat(QImage.Format.Format_RGBA8888)
@@ -1043,7 +1068,8 @@ def self_test(app, control, report_path, preview_path):
                  for a, b in ((0., .28), (.34, .66), (.72, 1.))]
         assert areas[1] > max(areas[0], areas[2]) * 1.5, areas
         result["lyrics_viewport"] = dict(clipped=True, edge_fade=True, center_emphasis=True,
-                                         animated_scroll=True, seek_and_pause=True, stale_result_rejected=True)
+                                         animated_scroll=True, seek_and_pause=True, stale_result_rejected=True,
+                                         jitter_no_rewind=True, arrives_on_cue=True, timing_calibration=True)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()

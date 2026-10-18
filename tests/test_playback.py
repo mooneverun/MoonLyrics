@@ -1,6 +1,6 @@
 import unittest
 
-from moonlyrics.playback import PlaybackSnapshot, apple_metadata, format_time, timeline_anchor
+from moonlyrics.playback import LyricClock, PlaybackSnapshot, apple_metadata, format_time, timeline_anchor
 
 
 class PlaybackTests(unittest.TestCase):
@@ -43,6 +43,46 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(format_time(64.9), "1:04")
         self.assertEqual(format_time(3661), "1:01:01")
         self.assertEqual(format_time(float("nan")), "0:00")
+
+
+class LyricClockTests(unittest.TestCase):
+    def sample(self, position, now, **values):
+        return PlaybackSnapshot(title="Song", artist="Singer", status="playing", position=position,
+                                duration=200, observed_at=now, **values)
+
+    def test_boundary_jitter_does_not_rewind_and_corrections_are_continuous(self):
+        clock = LyricClock()
+        clock.update(self.sample(67.85, 100), 100)
+        positions = [clock.position_at(100)]
+        for now, reported in ((100.2, 68.05), (100.25, 67.96), (100.3, 68.03),
+                              (100.35, 67.98), (100.5, 68.12)):
+            before = clock.position_at(now)
+            clock.update(self.sample(reported, now), now)
+            self.assertAlmostEqual(clock.position_at(now), before)
+            positions.append(clock.position_at(now))
+        self.assertTrue(all(b >= a for a, b in zip(positions, positions[1:])))
+        self.assertGreater(clock.position_at(100.8), positions[-1])
+
+    def test_real_forward_backward_seek_and_track_change_reset_immediately(self):
+        clock = LyricClock(); clock.update(self.sample(68, 100), 100)
+        clock.update(self.sample(90, 100.5), 100.5)
+        self.assertEqual(clock.position_at(100.5), 90)
+        clock.update(self.sample(20, 101), 101)
+        self.assertEqual(clock.position_at(101), 20)
+        next_track = PlaybackSnapshot(title="New Song", status="playing", position=0, observed_at=101.1)
+        clock.update(next_track, 101.1)
+        self.assertEqual(clock.position_at(101.1), 0)
+
+    def test_pause_resume_stale_feed_and_duration_bounds(self):
+        clock = LyricClock(); clock.update(self.sample(68, 100), 100)
+        paused = PlaybackSnapshot(title="Song", artist="Singer", status="paused", position=68.2, duration=200)
+        clock.update(paused, 100.2)
+        self.assertEqual(clock.position_at(101), 68.2)
+        clock.update(self.sample(68.2, 101), 101)
+        self.assertAlmostEqual(clock.position_at(101.2), 68.4)
+        self.assertEqual(clock.position_at(200), clock.position_at(104))
+        clock.update(self.sample(199, 200, rate=2), 200)
+        self.assertEqual(clock.position_at(201), 200)
 
 
 if __name__ == "__main__":

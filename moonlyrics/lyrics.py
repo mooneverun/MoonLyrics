@@ -57,6 +57,19 @@ class Lyrics:
     def index_at(self, position):
         return bisect_right(self.lines, position, key=lambda line: line.time) - 1
 
+    def scroll_at(self, position):
+        """Ease into the next line before its cue, arriving exactly on time."""
+        index = self.index_at(position)
+        if index >= len(self.lines) - 1:
+            return float(index)
+        cue = self.lines[index + 1].time
+        span = min(.55, (cue - self.lines[index].time) * .6) if index >= 0 else .55
+        if span <= 0:
+            return float(index)
+        fraction = max(0., min(1., (position - cue + span) / span))
+        eased = fraction ** 3 * (10 + fraction * (-15 + 6 * fraction))
+        return index + eased
+
 
 def parse_lrc(text):
     if not isinstance(text, str) or len(text) > 1_000_000:
