@@ -17,6 +17,8 @@ _simplified, _traditional = OpenCC("t2s"), OpenCC("s2t")
 _stamp = re.compile(r"\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]")
 _word_stamp = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d+)?>")
 _remaster = re.compile(r"\s*[\[(（][^\])）]*(?:remaster|重制|重製)[^\])）]*[\])）]|\s*[-–—]\s*(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?", re.I)
+# Verified performer names: Apple lists 連麻; KuGou's artist profile lists 连麻Swimming.
+_verified_artist_names = {"连麻": ("连麻Swimming",), "连麻swimming": ("连麻",)}
 
 
 def normalize(text):
@@ -39,6 +41,11 @@ class Track:
     artist: str
     album: str = ""
     duration: float = 0.
+
+
+def _known_aliases(track):
+    return [track] + [Track(track.title, name, track.album, track.duration)
+                      for name in _verified_artist_names.get(normalize(track.artist), ())]
 
 
 @dataclass(frozen=True)
@@ -81,7 +88,7 @@ def parse_lrc(text):
         stamps = list(_stamp.finditer(raw))
         if not stamps:
             continue
-        content = _word_stamp.sub("", raw[stamps[-1].end():]).strip()
+        content = _simplified.convert(_word_stamp.sub("", raw[stamps[-1].end():]).strip())
         for stamp in stamps:
             seconds = int(stamp[1]) * 60 + int(stamp[2]) + int((stamp[3] or "0").ljust(3, "0")) / 1000
             seconds = max(0., seconds - adjustment)
@@ -154,7 +161,7 @@ class LyricsFinder:
         key = track, storefront
         if key in self.alias_cache:
             return self.alias_cache[key]
-        aliases = [track]
+        aliases = _known_aliases(track)
         try:
             payload = self._json("https://itunes.apple.com/search", term=f"{track.title} {track.artist}",
                                  country=storefront, entity="song", limit=25)
@@ -168,8 +175,9 @@ class LyricsFinder:
                     for found_id, candidate in self._apple_tracks(localized):
                         if found_id != identifier or abs(candidate.duration - original.duration) > 1:
                             continue
-                        if candidate not in aliases:
-                            aliases.append(candidate)
+                        for alias in _known_aliases(candidate):
+                            if alias not in aliases:
+                                aliases.append(alias)
                     if any(has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
         except (requests.RequestException, ValueError, TypeError, KeyError):
@@ -255,7 +263,8 @@ class LyricsFinder:
         self.cache.pop(key, None)
         try:
             self._check()
-            aliases = [track]
+            base_aliases = _known_aliases(track)
+            aliases = base_aliases
             mixed = has_chinese(track.title + track.artist + track.album) and not (
                 has_chinese(track.title) and has_chinese(track.artist))
             if mixed:
@@ -263,9 +272,9 @@ class LyricsFinder:
             chinese = any(has_chinese(item.title + item.artist) for item in aliases)
             providers = (self._kugou, self._lrclib) if chinese else (self._lrclib, self._kugou)
             result = next((found for provider in providers if (found := provider(aliases))), None)
-            if result is None and aliases == [track]:
+            if result is None and aliases == base_aliases:
                 aliases = self._aliases(track, storefront)
-                if len(aliases) > 1:
+                if aliases != base_aliases:
                     result = self._kugou(aliases) or self._lrclib(aliases)
             self._check()
             if result:

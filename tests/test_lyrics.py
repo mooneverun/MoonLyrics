@@ -21,6 +21,10 @@ class ParserTests(TestCase):
         self.assertEqual(lines, (LyricLine(1.5, "月光 / Moonlight"),))
         self.assertEqual(parse_lrc("[offset:-200]\n[00:01]A")[0].time, 1.2)
 
+    def test_display_uses_simplified_chinese_without_changing_timing_or_english(self):
+        lines = parse_lrc("[00:01.20]遠走高飛 / Don't look back!\n[00:03.45]這裡還有月光")
+        self.assertEqual(lines, (LyricLine(1.2, "远走高飞 / Don't look back!"), LyricLine(3.45, "这里还有月光")))
+
     def test_scroll_arrives_at_cue_without_a_delayed_animation(self):
         document = Lyrics(tuple(LyricLine(t, "月光") for t in (60, 64, 68, 72)))
         self.assertEqual(document.scroll_at(67.4), 1.)
@@ -110,6 +114,23 @@ class FinderTests(TestCase):
         self.assertTrue(found.lines)
         self.assertEqual(self.finder._json.call_args.kwargs["id"], "correct")
         self.assertEqual(self.finder._json.call_args_list[0].kwargs["keyword"], "歌手 - 月光")
+
+    def test_verified_artist_name_finds_kugou_lyrics_for_traditional_apple_metadata(self):
+        track = Track("譚sir", "連麻", "譚sir - Single", 171)
+        payload = base64.b64encode(SAMPLE.encode()).decode()
+        def response(url, **params):
+            if url.endswith("/download"):
+                return dict(content=payload)
+            candidates = [dict(id="cover", accesskey="test", song="谭sir", singer="连麻Cover", duration=171720),
+                          dict(id="correct", accesskey="test", song="谭sir", singer="连麻Swimming", duration=171720)]
+            return dict(status=200, candidates=candidates if params.get("keyword") == "连麻Swimming - 谭sir" else [])
+        self.finder._json = Mock(side_effect=response)
+        self.finder._lrclib = Mock(return_value=None)
+        self.finder._aliases = Mock(return_value=[track])
+        found, _ = self.finder.find(track)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.artist, "连麻Swimming")
+        self.assertEqual(self.finder._json.call_args.kwargs["id"], "correct")
 
     def test_cache_prevents_repeated_network_search_and_can_be_retried(self):
         document = Lyrics(parse_lrc(SAMPLE), "测试")
