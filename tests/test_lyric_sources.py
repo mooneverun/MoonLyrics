@@ -295,6 +295,26 @@ class RegionalMatchingTests(TestCase):
 
 
 class AnonymousSourceTests(TestCase):
+    def test_first_automatic_search_accepts_an_embedded_title_reading_omitted_by_the_source(self):
+        track = Track("飞(FEY)1999", "99 God", "飞(FEY)1999", 98)
+        def response(url, **params):
+            if "search/get" in url:
+                return dict(code=200, result=dict(songs=[dict(id=21, name="飞1999", duration=98950,
+                    artists=[dict(id=12, name="99 God")], album=dict(name="飞1999"))]))
+            if "song/lyric" in url:
+                return dict(code=200, lrc=dict(lyric=LRC))
+            raise AssertionError("An exact performer must not require alias requests")
+        self.finder._json = Mock(side_effect=response)
+        self.finder._aliases = Mock(return_value=[track])
+        self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
+        for source in ("qq", "lrclib", "kugou"):
+            setattr(self.finder, "_" + source, Mock(return_value=None))
+        document, _ = self.finder.find(track, source_order=("netease", "qq", "lrclib", "kugou"))
+        self.assertIsNotNone(document, "A real timed lyric candidate was discarded before download")
+        self.assertEqual(document.source, "网易云音乐")
+        self.assertEqual(document.title, "飞1999")
+        self.finder._aliases.assert_not_called()
+
     def test_title_only_fallback_uses_artist_profiles_and_keeps_the_roster_check(self):
         track = Track("Moonlight", "Luna", duration=100)
         for source in ("netease", "qq"):

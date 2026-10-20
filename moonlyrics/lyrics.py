@@ -1,11 +1,18 @@
 """Synchronized lyric parsing and conservative cross-store track matching."""
 import base64
 from bisect import bisect_right
+from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from hashlib import sha256
 import html
+import json
 from itertools import islice
 import logging
+import math
+from pathlib import Path
 import re
+import sqlite3
 import time
 import unicodedata
 
@@ -14,13 +21,21 @@ import requests
 
 from .playback import finite
 from .styles import normalized_source_order
+from . import __version__
 
 LOG = logging.getLogger("moonlyrics.lyrics")
+CACHE_LIMIT, CACHE_BYTES, CACHE_AGE = 500, 20 * 1024 * 1024, 30 * 86400
 _simplified, _traditional = OpenCC("t2s"), OpenCC("s2t")
 _stamp = re.compile(r"\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]")
 _word_stamp = re.compile(r"<\d{1,3}:\d{2}(?:[.:]\d+)?>")
 _feature = r"(?:feat(?:uring)?|ft)(?:\.\s*|\s+)"
 _remaster = re.compile(r"\s*[\[(（][^\])）]*(?:remaster|重制|重製)[^\])）]*[\])）]|\s*[-–—]\s*(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?", re.I)
+_embedded_reading = re.compile(r"(?<=[\u3400-\u9fff])\s*(?:\(([A-Za-z]{1,16})\)|\[([A-Za-z]{1,16})\])\s*(?=[\u3400-\u9fff0-9])")
+_recording_labels = {"live", "remix", "mix", "rmx", "dj", "cover", "instrumental", "karaoke", "demo",
+                     "edit", "acoustic", "clean", "explicit", "mono", "stereo", "version", "ver", "extended",
+                     "short", "spedup", "slowed", "sloweddown", "radio", "piano", "acapella", "reprise",
+                     "rework", "remake", "unplugged", "studio", "original", "alternate", "bonus", "vip", "inst", "instr"}
+_album_versions = {"live", "remix", "instrumental", "karaoke", "cover", "acoustic", "dj"}
 
 
 def normalize(text):
@@ -30,7 +45,11 @@ def normalize(text):
 
 
 def title_name(text):
-    return normalize(_remaster.sub("", str(text or "")))
+    value = _remaster.sub("", unicodedata.normalize("NFKC", str(text or "")))
+    # Only attached, internal readings are optional; standalone bilingual titles still need verified aliases.
+    def keep_version(match):
+        return match[0] if (match[1] or match[2]).casefold() in _recording_labels else ""
+    return normalize(_embedded_reading.sub(keep_version, value))
 
 
 def has_chinese(text):
@@ -67,7 +86,9 @@ def split_credit(text):
 
 
 def bilingual_parts(text):
-    match = re.fullmatch(r"(.+?)\s*[\[(]([^\[\]()]+)[\])]", unicodedata.normalize("NFKC", text).strip())
+    value = unicodedata.normalize("NFKC", text).strip()
+    match = (re.fullmatch(r"(.+?)\s*[\[(]([^\[\]()]+)[\])]", value)
+             or re.fullmatch(r"([^:]+):([^:]+)", value))
     if match:
         left, right = match[1].strip(), match[2].strip()
         script = lambda value: (has_chinese(value), has_korean(value), bool(re.search(r"[A-Za-z]", value)))
@@ -127,6 +148,83 @@ class Track:
     artist: str
     album: str = ""
     duration: float = 0.
+    title_aliases: tuple = ()
+
+
+def catalog_names(record):
+    """Only structured, bounded names from the same catalog object are aliases."""
+    names = []
+    for key in ("name", "title", "trans", "foreign_name", "alias", "alia", "transNames", "tns"):
+        values = record.get(key) or []
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (tuple, list)) or len(values) > 32:
+            continue
+        names.extend(value.strip() for value in values
+                     if isinstance(value, str) and 0 < len(value.strip()) <= 256)
+    return tuple(dict.fromkeys(names))
+
+
+def name_forms(value, *, album=False):
+    value = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if album:
+        value = re.sub(r"\s*[-–—]\s*(?:single|ep)$", "", value, flags=re.I).strip()
+    parts = list(bilingual_parts(value))
+    for space in re.finditer(r"\s+", value):
+        left, right = value[:space.start()], value[space.end():]
+        if normalize(left) in _recording_labels or normalize(right) in _recording_labels:
+            continue
+        native = lambda text: has_chinese(text) or has_korean(text)
+        latin = lambda text: bool(re.search(r"[A-Za-z]", text))
+        if (native(left) and not latin(left) and latin(right) and not native(right)
+                or native(right) and not latin(right) and latin(left) and not native(left)):
+            parts.extend((left, right))
+    return {title_name(part) for part in (value, *parts) if title_name(part)}
+
+
+@dataclass(frozen=True)
+class MatchEvidence:
+    title: bool
+    fragment: bool
+    album: bool
+    gap: float
+    conflict: bool
+
+
+def recording_evidence(candidate, aliases):
+    gap = min((abs(candidate.duration - alias.duration) for alias in aliases if alias.duration > 0), default=float("inf"))
+    title = split_credit(candidate.title)[0]
+    fragment = any(name_forms(title) & name_forms(split_credit(alias.title)[0]) for alias in aliases)
+    album = bool(candidate.album) and any(alias.album and name_forms(candidate.album, album=True)
+                                         & name_forms(alias.album, album=True) for alias in aliases)
+    conflict = (candidate.duration <= 0 or gap > 5 or not any(
+        recording_version(candidate.title) == recording_version(alias.title)
+        and recording_version(candidate.album) & _album_versions == recording_version(alias.album) & _album_versions
+        for alias in aliases))
+    return MatchEvidence(metadata_rank(candidate, aliases) is not None, fragment, album, gap, conflict)
+
+
+@dataclass
+class LyricCandidate:
+    provider: str
+    identifier: object
+    track: Track
+    records: tuple
+    payload: dict
+    proof: str = ""
+
+
+def recording_version(title):
+    title = split_credit(title)[0]
+    blocks = re.findall(r"[\[(（]([^\])）]+)[\])）]|\s[-–—]\s(.+)$", title)
+    labels = set()
+    for block in blocks:
+        text = " ".join(block).casefold()
+        labels.update(word for word in re.findall(r"[a-z]+", text) if word in _recording_labels)
+        labels.update(word for word in ("现场", "現場", "伴奏", "翻唱", "纯音乐", "純音樂") if word in text)
+    equivalents = {"inst": "instrumental", "instr": "instrumental", "rmx": "remix", "现场": "live", "現場": "live",
+                   "伴奏": "instrumental", "翻唱": "cover", "纯音乐": "instrumental", "純音樂": "instrumental"}
+    return {equivalents.get(label, label) for label in labels}
 
 
 def related_artist_name(left, right):
@@ -215,9 +313,14 @@ def metadata_rank(candidate, aliases, tolerance=5):
     known_titles = {title_name(split_credit(alias.title)[0]) for alias in aliases}
     if title_name(title) not in known_titles:
         bilingual = bilingual_parts(title)
-        if not bilingual or not all(title_name(part) in known_titles for part in bilingual):
+        translated = any(title_name(split_credit(name)[0]) in known_titles
+                         and any(recording_version(candidate.title) == recording_version(alias.title) for alias in aliases)
+                         for name in candidate.title_aliases)
+        if not translated and (not bilingual or not all(title_name(part) in known_titles for part in bilingual)):
             return None
     for expected in aliases:
+        if recording_version(candidate.album) & _album_versions != recording_version(expected.album) & _album_versions:
+            continue
         difference = abs(candidate.duration - expected.duration)
         if expected.duration > 0 and (candidate.duration <= 0 or difference > tolerance):
             continue
@@ -227,10 +330,24 @@ def metadata_rank(candidate, aliases, tolerance=5):
 
 def match_rank(candidate, aliases, tolerance=5):
     """Title AND the complete performer roster must agree; duration rejects versions."""
-    rank = metadata_rank(candidate, aliases, tolerance)
+    # Wider search recall must not adopt same-named language versions a few seconds apart.
+    rank = metadata_rank(candidate, aliases, min(tolerance, 1.5))
     if rank is not None:
         parts = artist_parts(candidate.artist + " & " + split_credit(candidate.title)[1])
-        if any(same_artist_groups(parts, roster) for roster in recording_rosters(aliases)):
+        rosters = [parts]
+        guests = artist_parts(split_credit(candidate.title)[1])
+        primary = artist_parts(candidate.artist)
+        for guest in guests:
+            matches = [index for index, part in enumerate(primary) if part & guest]
+            if len(matches) == 1:
+                primary.pop(matches[0])
+        # A catalog's translated title can translate the complete featured block as well as the song name.
+        for title in candidate.title_aliases:
+            translated = artist_parts(split_credit(title)[1], affiliations=True)
+            if (guests and len(translated) == len(guests)
+                    and recording_version(title) == recording_version(candidate.title)):
+                rosters.append(primary + translated)
+        if any(same_artist_groups(parts, roster) for parts in rosters for roster in recording_rosters(aliases)):
             return rank
     return None
 
@@ -244,19 +361,375 @@ class StageExpired(Exception):
 
 
 class LyricsFinder:
-    def __init__(self):
+    def __init__(self, cache_dir=None):
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "MoonLyrics/0.1 (https://github.com/mooneverun/MoonLyrics)"
         self.cache = {}
+        self.cache_path = Path(cache_dir) / "lyrics.sqlite3" if cache_dir is not None else None
         self.alias_cache = {}
         self.artist_cache = {}
         self.artist_round_cache = {}
         self.profile_requests = 0
         self.stage_deadline = None
         self.failures = set()
+        self.apple_records = {}
+        self.album_cache = {}
+        self.candidate_albums = {}
+        self.round_cache = {}
+        self.plain_found = self.uncertain_found = False
+        self.lrclib_next = 0.
+        self.lrclib_retry_at = 0.
+        self.candidates = {}
+        self.cover_cache = {}
+        self.artist_albums = {}
+        self.current_track = None
+        self.current_storefront = "tr"
+        self.retryable = True
+        self.diagnostics = {}
+        self.attempted_lyrics = set()
+        self.request_count = 0
+        self.selected_candidate = None
+        self.lookup_key = None
+        self.lookup_started = 0.
+        self.endpoint_retry_at = {}
 
     def close(self):
         self.session.close()
+
+    def _cache_key(self, track, storefront, order):
+        # Keep punctuation and version labels; upgrades must recheck old matching decisions.
+        names = [" ".join(unicodedata.normalize("NFKC", name).casefold().split())
+                 for name in (track.title, track.artist, track.album)]
+        return sha256(json.dumps([1, __version__, names, storefront, order], ensure_ascii=False).encode()).hexdigest()
+
+    def _cached_lyrics(self, track, storefront, order):
+        if self.cache_path is None or track.duration <= 0:
+            return None
+        try:
+            if not self.cache_path.is_file():
+                return None
+            with closing(sqlite3.connect(self.cache_path, timeout=.1)) as db, db:
+                db.execute("PRAGMA cache_size=-256")
+                row = db.execute("SELECT duration, data FROM lyrics WHERE identity=? AND ABS(duration-?)<=0.25 "
+                                 "AND saved>=? AND length(CAST(data AS BLOB))<=1000000 "
+                                 "ORDER BY ABS(duration-?) LIMIT 1",
+                                 (self._cache_key(track, storefront, order), track.duration,
+                                  time.time() - CACHE_AGE, track.duration)).fetchone()
+                if row is None:
+                    return None
+                data = json.loads(row[1])
+                if (not isinstance(data, dict) or data.get("source") not in ("酷狗", "LRCLIB", "网易云音乐", "QQ音乐")
+                        or any(not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 1024
+                               for key in ("title", "artist"))
+                        or not isinstance(data.get("lines"), list) or not 2 <= len(data["lines"]) <= 8000):
+                    return None
+                lines = []
+                for line in data["lines"]:
+                    if (not isinstance(line, list) or len(line) != 2 or type(line[0]) not in (int, float)
+                            or not math.isfinite(line[0]) or not 0 <= line[0] <= 8 * 3600
+                            or not isinstance(line[1], str) or len(line[1]) > 16000
+                            or lines and line[0] <= lines[-1].time):
+                        return None
+                    lines.append(LyricLine(line[0], line[1]))
+                if sum(bool(line.text.strip()) and line.time <= track.duration + 5 for line in lines) < 2:
+                    return None
+                db.execute("UPDATE lyrics SET used=? WHERE identity=? AND duration=?",
+                           (time.time(), self._cache_key(track, storefront, order), row[0]))
+                return Lyrics(tuple(lines), data["source"], data["title"], data["artist"])
+        except (OSError, sqlite3.Error, ValueError, TypeError, RecursionError):
+            LOG.warning("Local lyric cache unavailable; continuing with online matching")
+        return None
+
+    def _cache_lyrics(self, track, storefront, order, document, selected):
+        if self.cache_path is None or selected is None or not math.isfinite(track.duration) or track.duration <= 0:
+            return
+        try:
+            data = json.dumps(dict(source=document.source, title=document.title, artist=document.artist,
+                                   lines=[(line.time, line.text) for line in document.lines], selected=selected),
+                              ensure_ascii=False, allow_nan=False)
+            if len(data.encode("utf-8")) > 1_000_000:
+                return
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(self.cache_path, timeout=.1)) as db, db:
+                db.execute("PRAGMA cache_size=-256")
+                db.execute("CREATE TABLE IF NOT EXISTS lyrics (identity TEXT NOT NULL, duration REAL NOT NULL, "
+                           "data TEXT NOT NULL, saved REAL NOT NULL, used REAL NOT NULL, PRIMARY KEY(identity,duration))")
+                now = time.time()
+                db.execute("INSERT OR REPLACE INTO lyrics VALUES(?,?,?,?,?)",
+                           (self._cache_key(track, storefront, order), track.duration, data, now, now))
+                db.execute("DELETE FROM lyrics WHERE saved<?", (now - CACHE_AGE,))
+                rows = db.execute("SELECT identity,duration,length(CAST(data AS BLOB)) FROM lyrics ORDER BY used DESC").fetchall()
+                size = 0
+                for index, (identity, duration, length) in enumerate(rows):
+                    size += length
+                    if index >= CACHE_LIMIT or size > CACHE_BYTES:
+                        db.execute("DELETE FROM lyrics WHERE identity=? AND duration=?", (identity, duration))
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            LOG.warning("Could not save local lyrics; playback is unaffected")
+
+    def clear_cache(self):
+        self.cache.clear()
+        self.round_cache.clear()
+        self.candidates.clear()
+        if self.cache_path is not None:
+            try:
+                self.cache_path.unlink(missing_ok=True)
+            except OSError:
+                LOG.warning("Could not clear local lyric cache")
+                return False
+        return True
+
+    def _remember(self, provider, identifier, track, records=(), payload=None):
+        if not identifier or not track.title or not track.artist or track.duration <= 0:
+            return
+        self.candidates[provider, identifier] = LyricCandidate(provider, identifier, track, tuple(records), payload or {})
+        if len(self.candidates) > 64:
+            aliases = self.alias_cache.get((self.current_track, self.current_storefront), [self.current_track])
+            def relevance(key):
+                item = self.candidates[key]
+                if not self.current_track:
+                    return (True, True, item.track.duration)
+                facts = recording_evidence(item.track, aliases)
+                return (not facts.title, not facts.fragment, facts.gap)
+            self.candidates.pop(max(reversed(self.candidates), key=relevance))
+
+    def _download(self, candidate):
+        key = candidate.provider, candidate.identifier
+        if key in self.attempted_lyrics:
+            return None
+        provider, identifier = key
+        try:
+            if provider == "netease":
+                data = self._json("https://music.163.com/api/song/lyric", headers={"Referer": "https://music.163.com/"},
+                                  id=identifier, lv=-1, kv=-1, tv=-1)
+                if not isinstance(data, dict) or data.get("code") != 200 or not isinstance(data.get("lrc"), dict):
+                    raise ValueError("Invalid NetEase lyric response")
+                raw = "" if data.get("nolyric") else data["lrc"].get("lyric") or ""
+            elif provider == "qq":
+                data = self._json("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
+                                  headers={"Referer": "https://y.qq.com/"}, songmid=identifier, format="json", nobase64=1)
+                if not isinstance(data, dict) or data.get("code") != 0:
+                    raise ValueError("Invalid QQ lyric response")
+                raw = data.get("lyric") or ""
+            elif provider == "kugou":
+                data = self._json("https://lyrics.kugou.com/download", ver=1, client="pc", id=identifier,
+                                  accesskey=candidate.payload["accesskey"], fmt="lrc", charset="utf8")
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid Kugou lyric response")
+                raw = base64.b64decode(data.get("content", ""), validate=True).decode("utf-8-sig")
+            else:
+                raw = candidate.payload.get("syncedLyrics") or candidate.payload.get("plainLyrics") or ""
+            raw = html.unescape(raw)
+            lines = parse_synced_lrc(raw, candidate.track.duration)
+            if lines:
+                self.selected_candidate = candidate
+                return Lyrics(lines, {"netease": "网易云音乐", "qq": "QQ音乐", "kugou": "酷狗", "lrclib": "LRCLIB"}[provider],
+                              candidate.track.title, candidate.track.artist)
+            self.attempted_lyrics.add(key)
+            self.plain_found |= len(raw.strip()) >= 20 and not _stamp.search(raw)
+        except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError):
+            self.failures.add(provider + " lyrics")
+        return None
+
+    def _resolve_candidates(self, aliases, order, *, deep=False):
+        for provider in order:
+            retained = [item for item in self.candidates.values() if item.provider == provider]
+            matches = []
+            for item in retained:
+                facts = recording_evidence(item.track, aliases)
+                if facts.conflict:
+                    continue
+                rank = (not facts.title, not facts.album, facts.gap)
+                matches.append((rank, item.identifier, item.track, item.records))
+            accepted = (self._source_matches(provider, matches, aliases) if provider in ("netease", "qq")
+                        else (row[:3] for row in sorted(matches, key=lambda row: row[0])
+                              if match_rank(row[2], aliases) is not None))
+            for _, identifier, _ in islice(accepted, 2):
+                result = self._download(self.candidates[provider, identifier])
+                if result:
+                    return result
+            if deep and provider in ("netease", "qq"):
+                verified = [item for item in retained if self._verify_single(item, aliases)]
+                # Several different credit sets remain ambiguous even when their releases look alike.
+                credits = {tuple(sorted(normalize(record.get("name")) for record in item.records)) for item in verified}
+                if len(credits) > 1:
+                    self.uncertain_found = True
+                    continue
+                for item in verified[:2]:
+                    result = self._download(item)
+                    if result:
+                        return result
+        return None
+
+    def _artist_catalog(self, track, storefront):
+        if not track.album:
+            return
+        payload = self._json("https://itunes.apple.com/search", term=track.artist,
+                             country=storefront, entity="musicArtist", limit=10)
+        rows = payload.get("results", []) if isinstance(payload, dict) else []
+        artists = [row for row in rows[:10] if isinstance(row, dict) and type(row.get("artistId")) is int
+                   and row["artistId"] > 0 and same_artists(str(row.get("artistName") or ""), track.artist)]
+        if not artists:
+            return
+        artists.sort(key=lambda row: row["artistName"].casefold() != track.artist.casefold())
+        matches = []
+        for artist in artists[:3]:
+            key = artist["artistId"], storefront
+            albums = self.artist_albums.get(key)
+            if albums is None:
+                data = self._json("https://itunes.apple.com/lookup", id=artist["artistId"], country=storefront,
+                                  entity="album", limit=200)
+                albums = data.get("results", []) if isinstance(data, dict) else []
+                if not isinstance(albums, list):
+                    continue
+                if len(self.artist_albums) >= 16:
+                    self.artist_albums.pop(next(iter(self.artist_albums)))
+                self.artist_albums[key] = albums
+            matches.extend(row for row in albums[:200] if isinstance(row, dict) and type(row.get("collectionId")) is int
+                           and row["collectionId"] > 0 and name_forms(row.get("collectionName"), album=True)
+                           & name_forms(track.album, album=True)
+                           and same_artists(str(row.get("artistName") or ""), track.artist))
+        verified = []
+        for album in matches[:2]:
+            data = self._json("https://itunes.apple.com/lookup", id=album["collectionId"], country=storefront,
+                              entity="song", limit=200)
+            for row in data.get("results", []) if isinstance(data, dict) else []:
+                if not isinstance(row, dict) or row.get("collectionId") != album["collectionId"]:
+                    continue
+                for identifier, candidate in self._apple_tracks(dict(results=[row])):
+                    if identifier and match_rank(candidate, [track], tolerance=1.5) is not None:
+                        verified.append(row)
+        if len({row["trackId"] for row in verified}) == 1:
+            if len(self.apple_records) >= 64:
+                self.apple_records.pop(next(iter(self.apple_records)))
+            self.apple_records[track, storefront] = verified[0]
+
+    def _same_cover(self, left, right):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage
+        signatures = []
+        for url in (left, right):
+            if not isinstance(url, str):
+                return False
+            url = url.replace("http://", "https://", 1)
+            if not re.fullmatch(r"https://(?:is\d-ssl\.mzstatic\.com|p\d\.music\.126\.net|y\.gtimg\.cn)/[^\s]{1,1500}", url):
+                return False
+            if re.match(r"https://p\d\.music\.126\.net/", url) and "?" not in url:
+                url += "?param=100y100"
+            if url not in self.cover_cache:
+                self._check()
+                remaining = min(self.deadline, self.stage_deadline or self.deadline) - time.monotonic()
+                self.request_count += 1
+                response = self.session.get(url, timeout=max(.1, min(2., remaining)))
+                response.raise_for_status()
+                if len(response.content) > 1_000_000:
+                    return False
+                image = QImage.fromData(response.content)
+                if image.isNull() or max(image.width(), image.height()) > 4096:
+                    return False
+                image = image.scaled(16, 16, transformMode=Qt.TransformationMode.SmoothTransformation)
+                signature = tuple(channel for y in range(16) for x in range(16)
+                                  for channel in image.pixelColor(x, y).getRgb()[:3])
+                if len(self.cover_cache) >= 32:
+                    self.cover_cache.pop(next(iter(self.cover_cache)))
+                self.cover_cache[url] = signature
+                self._check()
+            signatures.append(self.cover_cache[url])
+        left, right = signatures
+        # Flat placeholder art cannot establish a release identity.
+        if any(sum(sum((value - sum(values[channel::3]) / 256) ** 2 for value in values[channel::3])
+                       for channel in range(3)) / len(values) < 100 for values in signatures):
+            return False
+        return sum(abs(a - b) for a, b in zip(left, right)) / len(left) <= 8
+
+    def _verify_single(self, item, aliases):
+        facts = recording_evidence(item.track, aliases)
+        original = self.apple_records.get((self.current_track, self.current_storefront))
+        if (facts.conflict or not facts.fragment or not facts.album or facts.gap > .5 or not original
+                or original.get("trackCount") != 1 or item.provider not in ("netease", "qq")):
+            return False
+        source = artist_parts(item.track.artist + " & " + split_credit(item.track.title)[1])
+        rosters = recording_rosters(aliases)
+        partial = False
+        for expected in rosters:
+            small, large = sorted((source, expected), key=len)
+            partial |= bool(small) and len(small) != len(large) and all(
+                sum(bool(part & other) for other in large) == 1 for part in small)
+        if not partial:
+            return False
+        identities = [self._artist_id(item.provider, record) for record in item.records]
+        if None in identities or len(set(identities)) != len(identities):
+            return False
+        try:
+            if item.provider == "netease":
+                album_id = item.payload.get("album", item.payload.get("al", {})).get("id")
+                if type(album_id) is not int or not 0 < album_id < 10 ** 15:
+                    return False
+                data = self._json(f"https://music.163.com/api/album/{album_id}", id=album_id,
+                                  headers={"Referer": "https://music.163.com/"})
+                album = data.get("album") if isinstance(data, dict) and data.get("code") == 200 else None
+                songs = data.get("songs", album.get("songs")) if isinstance(album, dict) else None
+                if (not isinstance(album, dict) or album.get("id") != album_id or not isinstance(songs, list)
+                        or len(songs) != 1 or not isinstance(songs[0], dict) or songs[0].get("id") != item.identifier):
+                    return False
+                candidate, _ = self._netease_record(songs[0])
+                source_day = datetime.fromtimestamp(finite(album.get("publishTime")) / 1000, timezone.utc).date()
+                cover = album.get("picUrl")
+            else:
+                album = item.payload.get("album", {})
+                mid = album.get("mid")
+                if not isinstance(mid, str) or not re.fullmatch(r"[A-Za-z0-9]{1,64}", mid):
+                    return False
+                body = dict(comm=dict(ct="19", cv="1859", uin="0"),
+                            req=dict(module="music.musichallAlbum.AlbumInfoServer", method="GetAlbumDetail",
+                                     param=dict(albumMid=mid)))
+                data = self._json("https://u.y.qq.com/cgi-bin/musicu.fcg", headers={"Referer": "https://y.qq.com/"}, body=body)
+                request = data.get("req") if isinstance(data, dict) and data.get("code") == 0 else None
+                details = request.get("data") if isinstance(request, dict) and request.get("code") == 0 else None
+                info = details.get("basicInfo") if isinstance(details, dict) else None
+                if not isinstance(info, dict):
+                    raise ValueError("Invalid QQ album detail response")
+                if info.get("albumMid") != mid or info.get("albumType") != "Single":
+                    return False
+                body = dict(body, req=dict(module="music.musichallAlbum.AlbumSongList", method="GetAlbumSongList",
+                            param=dict(albumMid=mid, albumID=album.get("id"), begin=0, num=10, order=2)))
+                data = self._json("https://u.y.qq.com/cgi-bin/musicu.fcg", headers={"Referer": "https://y.qq.com/"}, body=body)
+                request = data.get("req") if isinstance(data, dict) and data.get("code") == 0 else None
+                listing = request.get("data") if isinstance(request, dict) and request.get("code") == 0 else None
+                if not isinstance(listing, dict):
+                    raise ValueError("Invalid QQ album song response")
+                songs = listing.get("songList", [])
+                if (listing.get("albumMid") != mid or listing.get("totalNum") != 1 or not isinstance(songs, list)
+                        or len(songs) != 1 or not isinstance(songs[0], dict)):
+                    return False
+                song = songs[0].get("songInfo", {})
+                if not isinstance(song, dict) or not isinstance(song.get("album"), dict):
+                    return False
+                if song.get("mid") != item.identifier or song["album"].get("mid") != mid:
+                    return False
+                records = song.get("singer", [])
+                if not isinstance(records, list) or not all(isinstance(record, dict) and isinstance(record.get("name"), str)
+                                                          for record in records):
+                    return False
+                candidate = Track(str(song.get("title") or song.get("name") or ""),
+                                  " & ".join(record["name"] for record in records),
+                                  str(song.get("album", {}).get("name") or ""), finite(song.get("interval")))
+                source_day = datetime.fromisoformat(info["publishDate"]).date()
+                cover = f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{mid}.jpg"
+            original_duration = finite(original.get("trackTimeMillis")) / 1000
+            if (candidate is None or title_name(candidate.title) != title_name(item.track.title)
+                    or not same_artists(candidate.artist, item.track.artist)
+                    or abs(candidate.duration - original_duration) > (.15 if item.provider == "netease" else 1.)
+                    or not original.get("releaseDate")):
+                return False
+            apple_day = datetime.fromisoformat(original["releaseDate"].replace("Z", "+00:00")).date()
+            verified = source_day == apple_day and self._same_cover(original.get("artworkUrl100"), cover)
+            if verified:
+                item.proof = "single_release_artwork_date_timing_credits"
+            return verified
+        except (requests.RequestException, ValueError, TypeError, KeyError, OverflowError, OSError):
+            self.failures.add("Single release verification")
+            return False
 
     def _check(self):
         if self.cancelled():
@@ -273,6 +746,8 @@ class LyricsFinder:
         try:
             self._check()
             result = operation(*args, **kwargs)
+            if result is not None:
+                self.stage_deadline = previous
             self._check()
             return result
         except StageExpired:
@@ -285,6 +760,18 @@ class LyricsFinder:
 
     def _json(self, url, *, body=None, headers=None, **params):
         self._check()
+        key = url, json.dumps((params, body, headers), sort_keys=True, ensure_ascii=True)
+        if key in self.round_cache:
+            return self.round_cache[key]
+        if time.monotonic() < self.endpoint_retry_at.get(url, 0):
+            self.failures.add(url)
+            raise requests.RequestException("Endpoint is temporarily limited; respecting backoff")
+        if "lrclib.net/" in url:
+            delay = self.lrclib_next - time.monotonic()
+            if delay > 0:
+                time.sleep(min(delay, .5))
+                self._check()
+            self.lrclib_next = time.monotonic() + .25
         response = None
         try:
             remaining = min(self.deadline, self.stage_deadline or self.deadline) - time.monotonic()
@@ -293,6 +780,7 @@ class LyricsFinder:
                     raise TimeoutError("歌词匹配超时，可以重新尝试")
                 raise StageExpired()
             options = dict(timeout=(min(1.5, remaining * .35), min(3., remaining * .65)))
+            self.request_count += 1
             if headers:
                 options["headers"] = headers
             response = (self.session.get(url, params=params, **options) if body is None
@@ -301,11 +789,24 @@ class LyricsFinder:
             if len(response.content) > 3_000_000:
                 raise ValueError("Lyrics response is too large")
             data = response.json()
+            if isinstance(data, dict) and data.get("code") in (-462, 301):
+                self.endpoint_retry_at[url] = time.monotonic() + 60
+                raise requests.RequestException("Anonymous catalog access is temporarily limited")
         except (requests.RequestException, ValueError) as exc:
             self.failures.add(url)
+            if getattr(response, "status_code", None) in (429, 503):
+                try:
+                    seconds = max(2., min(120., float(response.headers.get("Retry-After", "15"))))
+                except (ValueError, TypeError):
+                    seconds = 15.
+                self.endpoint_retry_at[url] = time.monotonic() + seconds
             LOG.info("Lyric request failed: endpoint=%s status=%s error=%s",
                      url, getattr(response, "status_code", None), type(exc).__name__)
             raise
+        if (len(self.round_cache) < 96 and (not isinstance(data, dict)
+                or data.get("code", 0) in (0, 200) and data.get("status", 200) in (1, 200)
+                and (not isinstance(data.get("req"), dict) or data["req"].get("code", 0) == 0))):
+            self.round_cache[key] = data
         self._check()
         return data
 
@@ -335,6 +836,7 @@ class LyricsFinder:
                 payload = dict(results=[])
             matches = [(match_rank(candidate, [track]), identifier, candidate)
                        for identifier, candidate in self._apple_tracks(payload)]
+            catalog_records = payload["results"]
             matches = [item for item in matches if item[0] is not None and item[1]]
             if not matches and normalize(track.album) and track.duration > 0:
                 # Song search may omit the vocal recording while the public album still lists it.
@@ -364,12 +866,19 @@ class LyricsFinder:
                                    for identifier, candidate in self._apple_tracks(dict(results=songs))]
                         matches = [item for item in matches if item[0] is not None and item[1]]
                         if matches:
+                            catalog_records = songs
                             LOG.info("Recording recovered from Apple album: album_id=%s", album_id)
                             break
                     except (requests.RequestException, ValueError, TypeError, KeyError):
                         self.failures.add("Apple album names")
             if matches:
                 _, identifier, original = min(matches, key=lambda item: item[0])
+                record = next((item for item in catalog_records if isinstance(item, dict)
+                               and item.get("trackId") == identifier), {})
+                if type(record.get("collectionId")) is int and record["collectionId"] > 0:
+                    if len(self.apple_records) >= 64:
+                        self.apple_records.pop(next(iter(self.apple_records)))
+                    self.apple_records[key] = record
                 chinese = has_chinese(track.title + track.artist + track.album)
                 checked_korean = False
                 for country in (("hk", "tw", "kr") if chinese else ("kr", "hk", "tw")):
@@ -397,6 +906,10 @@ class LyricsFinder:
                     if any(has_korean(alias.title + alias.artist)
                            or checked_korean and has_chinese(alias.title) and has_chinese(alias.artist) for alias in aliases):
                         break
+                paired = self.album_cache.get((record.get("collectionId"), storefront), ())
+                for apple, source, _ in paired:
+                    if apple["trackId"] == identifier and source not in aliases:
+                        aliases.append(source)
         except (requests.RequestException, ValueError, TypeError, KeyError):
             LOG.debug("Apple localized name lookup unavailable", exc_info=True)
         self._check()
@@ -467,29 +980,24 @@ class LyricsFinder:
                         continue
                     candidate = Track(str(item.get("song") or ""), str(item.get("singer") or ""),
                                       duration=finite(item.get("duration")) / 1000)
+                    if abs(candidate.duration - aliases[0].duration) <= tolerance and item.get("accesskey"):
+                        self._remember("kugou", item.get("id"), candidate, payload=item)
                     rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None and item.get("id") and item.get("accesskey"):
                         matches.append((rank, item, candidate))
                 LOG.info("Lyric search: provider=KuGou candidates=%s accepted=%s", len(candidates), len(matches))
                 for _, item, candidate in sorted(matches, key=lambda item: item[0])[:2]:
-                    try:
-                        payload = self._json("https://lyrics.kugou.com/download", ver=1, client="pc", id=item["id"],
-                                             accesskey=item["accesskey"], fmt="lrc", charset="utf8")
-                        if not isinstance(payload, dict):
-                            self.failures.add("KuGou download")
-                            continue
-                        raw = base64.b64decode(payload.get("content", ""), validate=True).decode("utf-8-sig")
-                        lines = parse_synced_lrc(raw, candidate.duration)
-                        if lines:
-                            return Lyrics(lines, "酷狗", candidate.title, candidate.artist)
-                    except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError) as error:
-                        self.failures.add("KuGou download")
-                        LOG.info("Lyric candidate download failed: provider=KuGou error=%s", type(error).__name__)
+                    result = self._download(LyricCandidate("kugou", item["id"], candidate, (), item))
+                    if result:
+                        return result
             except (requests.RequestException, ValueError, TypeError, KeyError, UnicodeError):
                 LOG.debug("KuGou lyrics unavailable", exc_info=True)
         return None
 
     def _lrclib(self, aliases, tolerance=5):
+        if time.monotonic() < self.lrclib_retry_at:
+            self.failures.add("LRCLIB rate limit")
+            return None
         queries = []
         for track in aliases:
             title = split_credit(track.title)[0]
@@ -512,22 +1020,173 @@ class LyricsFinder:
                     continue
                 self.reachable = True
                 matches = []
-                for item in data[:200]:
-                    if not isinstance(item, dict) or not item.get("syncedLyrics") or item.get("instrumental") is True:
+                for index, item in enumerate(data[:200]):
+                    if not isinstance(item, dict) or item.get("instrumental") is True:
                         continue
                     candidate = Track(str(item.get("trackName") or ""), str(item.get("artistName") or ""),
                                       str(item.get("albumName") or ""), finite(item.get("duration")))
+                    identifier = item.get("id") or (candidate.title, candidate.artist, candidate.album, candidate.duration, index)
+                    if abs(candidate.duration - aliases[0].duration) <= tolerance:
+                        self._remember("lrclib", identifier, candidate, payload=item)
                     rank = match_rank(candidate, aliases, tolerance)
                     if rank is not None:
-                        matches.append((rank, item, candidate))
+                        matches.append((rank, identifier, item, candidate))
                 LOG.info("Lyric search: provider=LRCLIB candidates=%s accepted=%s", len(data), len(matches))
-                for _, item, candidate in sorted(matches, key=lambda item: item[0]):
-                    lines = parse_synced_lrc(item["syncedLyrics"], candidate.duration)
-                    if lines:
-                        return Lyrics(lines, "LRCLIB", candidate.title, candidate.artist)
-            except (requests.RequestException, ValueError, TypeError, KeyError):
+                for _, identifier, item, candidate in sorted(matches, key=lambda item: item[0]):
+                    result = self._download(LyricCandidate("lrclib", identifier, candidate, (), item))
+                    if result:
+                        return result
+            except (requests.RequestException, ValueError, TypeError, KeyError) as error:
                 LOG.debug("LRCLIB lyrics unavailable", exc_info=True)
+                if getattr(getattr(error, "response", None), "status_code", None) == 429:
+                    try:
+                        seconds = max(1., float(error.response.headers.get("Retry-After", "60")))
+                    except (TypeError, ValueError):
+                        seconds = 60.
+                    self.lrclib_retry_at = time.monotonic() + seconds
+                    break
         return None
+
+    @staticmethod
+    def _netease_record(item):
+        records = item.get("artists", item.get("ar"))
+        album = item.get("album", item.get("al"))
+        if (not isinstance(records, list) or not 0 < len(records) <= 16 or not isinstance(album, dict)
+                or not all(isinstance(artist, dict) and isinstance(artist.get("name"), str)
+                           and artist["name"].strip() for artist in records)):
+            return None, []
+        return Track(str(item.get("name") or ""), " & ".join(artist["name"] for artist in records),
+                     str(album.get("name") or ""), finite(item.get("duration", item.get("dt"))) / 1000,
+                     catalog_names(item)), records
+
+    @staticmethod
+    def _align_album(apple, source):
+        """A whole album's timing and multiple title anchors establish the recording, never a lone duration."""
+        if not 6 <= len(apple) == len(source) <= 60:
+            return None
+        if len({item.get("id") for item in source if isinstance(item, dict)}) != len(source):
+            return None
+        pairs, anchors, precise = [], 0, 0
+        for index, (original, item) in enumerate(zip(apple, source)):
+            if not isinstance(item, dict) or type(item.get("id")) is not int or not 0 < item["id"] < 10 ** 15:
+                return None
+            candidate, records = LyricsFinder._netease_record(item)
+            expected = next((track for _, track in LyricsFinder._apple_tracks(dict(results=[original]))), None)
+            number = item.get("no")
+            if (expected is None or candidate is None or candidate.duration <= 0 or expected.duration <= 0
+                    or type(number) is not int or number not in (original.get("trackNumber"), index + 1)
+                    or recording_version(expected.title) != recording_version(candidate.title)
+                    or recording_version(expected.album) & _album_versions != recording_version(candidate.album) & _album_versions):
+                return None
+            difference = abs(expected.duration - candidate.duration)
+            if difference > 1.5:
+                return None
+            precise += difference <= .5
+            # An incomplete credit on another track must not discard the album; never learn that track's names.
+            if (len(artist_parts(candidate.artist)) == len(artist_parts(expected.artist + " & " + split_credit(expected.title)[1]))
+                    and all(LyricsFinder._artist_id("netease", record) is not None for record in records)
+                    and len({record["id"] for record in records}) == len(records)):
+                anchors += metadata_rank(candidate, [expected], tolerance=1.5) is not None
+                localized = Track(split_credit(candidate.title)[0], candidate.artist, candidate.album, candidate.duration,
+                                  candidate.title_aliases)
+                pairs.append((original, localized, records))
+        if anchors < 2 or precise < max(6, len(apple) * .8):
+            return None
+        return pairs
+
+    def _album_aliases(self, track, storefront, aliases):
+        original = self.apple_records.get((track, storefront))
+        if not original:
+            return aliases
+        album_id, identifier = original["collectionId"], original["trackId"]
+        key = album_id, storefront
+        pairs = self.album_cache.get(key)
+        if pairs is None:
+            payload = self._json("https://itunes.apple.com/lookup", id=album_id, country=storefront,
+                                 entity="song", limit=200)
+            records = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(records, list):
+                return aliases
+            apple = [row for row in records if isinstance(row, dict) and row.get("kind") == "song"
+                     and row.get("collectionId") == album_id]
+            if (not 6 <= len(apple) <= 60 or len({row.get("trackId") for row in apple}) != len(apple)
+                    or any(row.get("trackCount") != len(apple) for row in apple)
+                    or not any(row.get("trackId") == identifier for row in apple)):
+                return aliases
+            positions = [(row.get("discNumber"), row.get("trackNumber")) for row in apple]
+            if (any(type(disc) is not int or type(number) is not int or min(disc, number) < 1
+                    for disc, number in positions) or len(set(positions)) != len(positions)):
+                return aliases
+            apple.sort(key=lambda row: (row["discNumber"], row["trackNumber"]))
+            # Guest tracks are useful cross-language anchors; search titles only, then verify the entire album.
+            anchors = sorted(apple, key=lambda row: (not bool(split_credit(row["trackName"])[1]),
+                bool(recording_version(row["trackName"])), -len(split_credit(row["trackName"])[0])))
+            album_ids = []
+            for row in anchors[:2]:
+                title = split_credit(row["trackName"])[0]
+                data = self._json("https://music.163.com/api/search/get", headers={"Referer": "https://music.163.com/"},
+                                  s=title, type=1, limit=20)
+                songs = data.get("result", {}).get("songs", []) if isinstance(data, dict) else []
+                expected = next((t for _, t in self._apple_tracks(dict(results=[row]))), None)
+                if not isinstance(songs, list) or expected is None:
+                    continue
+                for song in songs[:20]:
+                    if not isinstance(song, dict):
+                        continue
+                    candidate, _ = self._netease_record(song)
+                    album = song.get("album", song.get("al", {}))
+                    source_id = album.get("id") if isinstance(album, dict) else None
+                    if (candidate and metadata_rank(candidate, [expected], tolerance=1.5) is not None
+                            and type(source_id) is int and 0 < source_id < 10 ** 15 and source_id not in album_ids):
+                        album_ids.append(source_id)
+            album_ids.extend(key for key, _ in sorted(self.candidate_albums.items(), key=lambda item: item[1])
+                             if key not in album_ids)
+            verified = []
+            for source_id in album_ids[:3]:
+                try:
+                    data = self._json(f"https://music.163.com/api/album/{source_id}", id=source_id,
+                                      headers={"Referer": "https://music.163.com/"})
+                    album = data.get("album") if isinstance(data, dict) and data.get("code") == 200 else None
+                    if not isinstance(album, dict) or type(album.get("id")) is not int or album["id"] != source_id:
+                        continue
+                    songs = data.get("songs", album.get("songs"))
+                    if not isinstance(songs, list):
+                        continue
+                    aligned = self._align_album(apple, songs)
+                    if aligned:
+                        verified.append(aligned)
+                except (requests.RequestException, ValueError, TypeError, KeyError):
+                    self.failures.add("Album identity")
+            if not verified:
+                return aliases
+            signatures = {tuple(tuple(sorted(self._artist_id("netease", record) or 0 for record in records))
+                                for _, _, records in alignment) for alignment in verified}
+            if len(signatures) != 1:
+                self.uncertain_found = True
+                return aliases
+            pairs = verified[0]
+            if len(self.album_cache) >= 16:
+                self.album_cache.pop(next(iter(self.album_cache)))
+            self.album_cache[key] = pairs
+            # Learn a solo primary artist only when one source identity is common to every album track.
+            leads = {normalize(row["artistName"]) for row, _, _ in pairs}
+            common = set.intersection(*({self._artist_id("netease", record) for record in records}
+                                        for _, _, records in pairs)) - {None}
+            if len(leads) == len(common) == 1 and all(len(artist_parts(row["artistName"])) == 1 for row, _, _ in pairs):
+                identity = next(iter(common))
+                names = {normalize(record["name"]) for _, _, records in pairs for record in records
+                         if self._artist_id("netease", record) == identity}
+                if len(self.artist_cache) >= 256:
+                    self.artist_cache.pop(next(iter(self.artist_cache)))
+                self.artist_cache["netease", identity] = frozenset(names | leads) | self.artist_cache.get(("netease", identity), frozenset())
+            LOG.info("Album identity verified: apple=%s tracks=%s", album_id, len(pairs))
+        translated = next((source for row, source, _ in pairs if row["trackId"] == identifier), None)
+        if translated is not None and abs(translated.duration - track.duration) <= 1.5 and translated not in aliases:
+            aliases = [*aliases, translated]
+            if len(self.alias_cache) >= 64:
+                self.alias_cache.pop(next(iter(self.alias_cache)))
+            self.alias_cache[track, storefront] = aliases
+        return aliases
 
     @staticmethod
     def _search_queries(aliases):
@@ -614,14 +1273,34 @@ class LyricsFinder:
         rosters = recording_rosters(aliases)
         known = set().union(*(part for roster in rosters for part in roster))
         known_guests = set().union(*(part for alias in aliases for part in artist_parts(split_credit(alias.title)[1]))) or known
+        weak_titles = set()
+        for _, _, candidate, _ in matches:
+            facts = recording_evidence(candidate, aliases)
+            if (not facts.conflict and not facts.title and facts.fragment and facts.album and facts.gap <= .5
+                    and any(same_artist_groups(artist_parts(candidate.artist + " & " + split_credit(candidate.title)[1]), roster)
+                            for roster in rosters)):
+                weak_titles.add(title_name(candidate.title))
         # Verify and download lazily: a slow later profile must not discard an earlier valid song.
-        ordered = sorted(matches, key=lambda item: (match_rank(item[2], aliases) is None, item[0]))
+        ordered = sorted(matches, key=lambda item: (match_rank(item[2], aliases) is None,
+            not any(same_artist_groups(artist_parts(item[2].artist + " & " + split_credit(item[2].title)[1]), roster)
+                    for roster in rosters), item[0]))
         for rank, identifier, candidate, records in ordered[:6]:
             self._check()
+            facts = recording_evidence(candidate, aliases)
+            if facts.conflict or not (facts.title or facts.fragment and facts.album and facts.gap <= .5):
+                continue
+            if facts.gap > 1.5:
+                self.uncertain_found = True
+                continue
+            if not facts.title and len(weak_titles) > 1:
+                self.uncertain_found = True
+                continue
+            self.uncertain_found |= match_rank(candidate, aliases) is None
             groups, identities = [], []
             for record in records:
                 identity = self._artist_id(provider, record)
-                names = {normalize(name) for name in (record["name"], *bilingual_parts(record["name"])) if normalize(name)}
+                names = {normalize(name) for value in catalog_names(record)
+                         for name in (value, *bilingual_parts(value)) if normalize(name)}
                 if identity is not None and identity in identities:
                     groups[identities.index(identity)].update(names)
                 else:
@@ -649,58 +1328,63 @@ class LyricsFinder:
             groups.extend(part for part in guests if not any(part & names for names in groups))
             if any(same_artist_groups(groups, roster) for roster in rosters):
                 yield rank, identifier, candidate
+            else:
+                self.uncertain_found = True
 
     def _netease(self, aliases, tolerance=5):
         headers = {"Referer": "https://music.163.com/"}
+        valid_query = False
+        rejected_query = False
         for query in self._search_queries(aliases):
             try:
                 data = self._json("https://music.163.com/api/search/get", headers=headers, s=query, type=1, limit=20)
                 result = data.get("result") if isinstance(data, dict) else None
                 if not isinstance(data, dict) or data.get("code") != 200 or not isinstance(result, dict):
-                    self.failures.add("网易云音乐")
+                    rejected_query = True
                     LOG.info("Lyric service unavailable: provider=NetEase code=%s", data.get("code") if isinstance(data, dict) else None)
-                    return None
+                    if isinstance(data, dict) and data.get("code") in (301, -462):
+                        self.failures.add("网易云音乐")
+                        return None
+                    continue
                 songs = result.get("songs", [])
                 if not isinstance(songs, list):
-                    self.failures.add("网易云音乐")
-                    return None
+                    rejected_query = True
+                    continue
+                valid_query = True
                 self.reachable = True
                 matches = []
                 for item in songs[:50]:
-                    if not isinstance(item, dict) or not isinstance(item.get("artists"), list):
+                    if not isinstance(item, dict):
                         continue
-                    names = [artist.get("name") for artist in item["artists"] if isinstance(artist, dict)]
-                    album = item.get("album")
-                    if (not names or len(names) != len(item["artists"])
-                            or not all(isinstance(name, str) and name for name in names) or not isinstance(album, dict)):
+                    candidate, records = self._netease_record(item)
+                    if candidate is None:
                         continue
-                    candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
-                                      finite(item.get("duration")) / 1000)
+                    album = item.get("album", item.get("al", {}))
+                    album_id = album.get("id")
+                    difference = min(abs(candidate.duration - alias.duration) for alias in aliases)
+                    if (type(album_id) is int and 0 < album_id < 10 ** 15 and difference <= 1.5
+                            and (album_id in self.candidate_albums or len(self.candidate_albums) < 12)):
+                        self.candidate_albums[album_id] = min(difference, self.candidate_albums.get(album_id, difference))
                     rank = metadata_rank(candidate, aliases, tolerance)
                     identifier = item.get("id")
-                    if rank is not None and type(identifier) is int and 0 < identifier < 10 ** 15:
-                        matches.append((rank, identifier, candidate, item["artists"]))
+                    if difference <= tolerance and type(identifier) is int and 0 < identifier < 10 ** 15:
+                        self._remember("netease", identifier, candidate, records, item)
+                        matches.append((rank if rank is not None else (True, difference), identifier, candidate, records))
                 LOG.info("Lyric search: provider=NetEase candidates=%s recordings=%s", len(songs), len(matches))
                 for _, identifier, candidate in islice(self._source_matches("netease", matches, aliases), 2):
-                    try:
-                        payload = self._json("https://music.163.com/api/song/lyric", headers=headers,
-                                             id=identifier, lv=-1, kv=-1, tv=-1)
-                        if not isinstance(payload, dict) or payload.get("code") != 200:
-                            self.failures.add("网易云音乐歌词")
-                            continue
-                        lrc = payload.get("lrc")
-                        lines = (parse_synced_lrc(html.unescape(lrc.get("lyric") or ""), candidate.duration)
-                                 if isinstance(lrc, dict) and not payload.get("nolyric") else ())
-                        if lines:
-                            return Lyrics(lines, "网易云音乐", candidate.title, candidate.artist)
-                    except (requests.RequestException, ValueError, TypeError, KeyError):
-                        self.failures.add("网易云音乐歌词")
+                    result = self._download(LyricCandidate("netease", identifier, candidate, (), {}))
+                    if result:
+                        return result
             except (requests.RequestException, ValueError, TypeError, KeyError):
                 self.failures.add("网易云音乐")
+        if rejected_query and not valid_query:
+            self.failures.add("网易云音乐")
         return None
 
     def _qq(self, aliases, tolerance=5):
         headers = {"Referer": "https://y.qq.com/"}
+        valid_query = False
+        rejected_query = False
         for query in self._search_queries(aliases):
             try:
                 body = dict(comm=dict(ct="19", cv="1859", uin="0"), req=dict(method="DoSearchForQQMusicDesktop",
@@ -708,16 +1392,17 @@ class LyricsFinder:
                 data = self._json("https://u.y.qq.com/cgi-bin/musicu.fcg", headers=headers, body=body)
                 request = data.get("req") if isinstance(data, dict) else None
                 if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(request, dict) or request.get("code") != 0:
-                    self.failures.add("QQ音乐")
+                    rejected_query = True
                     LOG.info("Lyric service unavailable: provider=QQMusic code=%s", request.get("code") if isinstance(request, dict) else None)
-                    return None
+                    continue
                 container = request
                 for key in ("data", "body", "song"):
                     container = container.get(key) if isinstance(container, dict) else None
                 songs = container.get("list") if isinstance(container, dict) else None
                 if not isinstance(songs, list):
-                    self.failures.add("QQ音乐")
-                    return None
+                    rejected_query = True
+                    continue
+                valid_query = True
                 self.reachable = True
                 matches = []
                 for item in songs[:50]:
@@ -728,27 +1413,23 @@ class LyricsFinder:
                     if (not names or len(names) != len(item["singer"])
                             or not all(isinstance(name, str) and name for name in names) or not isinstance(album, dict)):
                         continue
-                    candidate = Track(str(item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
-                                      finite(item.get("interval")))
+                    candidate = Track(str(item.get("title") or item.get("name") or ""), " & ".join(names), str(album.get("name") or ""),
+                                      finite(item.get("interval")), catalog_names(item))
                     rank = metadata_rank(candidate, aliases, tolerance)
                     mid = item.get("mid")
-                    if rank is not None and isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", mid):
-                        matches.append((rank, mid, candidate, item["singer"]))
+                    difference = min(abs(candidate.duration - alias.duration) for alias in aliases)
+                    if difference <= tolerance and isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", mid):
+                        self._remember("qq", mid, candidate, item["singer"], item)
+                        matches.append((rank if rank is not None else (True, difference), mid, candidate, item["singer"]))
                 LOG.info("Lyric search: provider=QQMusic candidates=%s recordings=%s", len(songs), len(matches))
                 for _, mid, candidate in islice(self._source_matches("qq", matches, aliases), 2):
-                    try:
-                        payload = self._json("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", headers=headers,
-                                             songmid=mid, format="json", nobase64=1)
-                        if not isinstance(payload, dict) or payload.get("code") != 0:
-                            self.failures.add("QQ音乐歌词")
-                            continue
-                        lines = parse_synced_lrc(html.unescape(payload.get("lyric") or ""), candidate.duration)
-                        if lines:
-                            return Lyrics(lines, "QQ音乐", candidate.title, candidate.artist)
-                    except (requests.RequestException, ValueError, TypeError, KeyError):
-                        self.failures.add("QQ音乐歌词")
+                    result = self._download(LyricCandidate("qq", mid, candidate, (), {}))
+                    if result:
+                        return result
             except (requests.RequestException, ValueError, TypeError, KeyError):
                 self.failures.add("QQ音乐")
+        if rejected_query and not valid_query:
+            self.failures.add("QQ音乐")
         return None
 
     def _search_sources(self, aliases, providers, tolerance=5, reserve=0.):
@@ -761,29 +1442,96 @@ class LyricsFinder:
         return None
 
     def find(self, track, storefront="tr", cancelled=lambda: False, force=False, source_order=None):
-        self.cancelled, self.deadline, self.reachable = cancelled, time.monotonic() + 20, False
+        started = time.monotonic()
+        resume = (not force and self.lookup_key == (track, storefront) and self.retryable
+                  and started - self.lookup_started < 90)
+        if not resume:
+            self.round_cache.clear()
+            self.lookup_started = started
+        self.lookup_key = track, storefront
+        self.cancelled, self.deadline, self.reachable = cancelled, started + 30, False
+        self.current_track, self.current_storefront = track, storefront
+        self.candidates.clear()
+        self.attempted_lyrics.clear()
+        self.request_count = 0
+        self.selected_candidate = None
+        self.retryable = True
         self.failures = set()
+        self.candidate_albums.clear()
+        self.plain_found = self.uncertain_found = False
         self.profile_requests = 0
         self.artist_round_cache.clear()
         self._check()
         order = normalized_source_order(source_order)
         key = track, storefront, order
         alias_key = track, storefront
+        aliases = self.alias_cache.get(alias_key, [track])
+        def finish(document, message, outcome):
+            self.retryable = document is None and bool(self.failures)
+            decisions = []
+            for item in self.candidates.values():
+                facts = recording_evidence(item.track, aliases)
+                reason = ("recording_conflict" if facts.conflict else "title_unverified" if not facts.title and not facts.fragment
+                          else "duration_unverified" if facts.gap > 1.5
+                          else "no_timed_lyrics" if (item.provider, item.identifier) in self.attempted_lyrics
+                          else "credits_or_release_unverified")
+                if self.selected_candidate and (item.provider, item.identifier) == (
+                        self.selected_candidate.provider, self.selected_candidate.identifier):
+                    reason = "selected"
+                decisions.append(dict(source=item.provider, title=item.track.title, artist=item.track.artist, reason=reason))
+            chosen = self.selected_candidate
+            selected = (dict(source=chosen.provider, identifier=chosen.identifier, title=chosen.track.title,
+                             artist=chosen.track.artist, album=chosen.track.album, duration=chosen.track.duration,
+                             proof=chosen.proof or ("verified_title_full_credits_duration" if recording_evidence(chosen.track, aliases).title
+                                                   else "bilingual_fragment_album_full_credits_precise_duration")) if chosen else None)
+            self.diagnostics = dict(outcome=outcome, selected=selected, requests=self.request_count, candidates=len(self.candidates),
+                                    elapsed=round(time.monotonic() - started, 3), retryable=self.retryable,
+                                    incomplete=sorted(self.failures), decisions=decisions)
+            LOG.info("Lyric decision: %s", json.dumps(self.diagnostics, ensure_ascii=False))
+            return document, message
         if not force and key in self.cache:
             cached = self.cache[key]
-            return cached, f"已匹配 · {cached.source} · {len(cached.lines)} 行（缓存）"
+            return finish(cached, f"已匹配 · {cached.source} · {len(cached.lines)} 行（缓存）", "cached")
+        if not force:
+            cached = self._cached_lyrics(track, storefront, order)
+            self._check()
+            if cached is not None:
+                if len(self.cache) >= 64:
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[key] = cached
+                return finish(cached, f"已匹配 · {cached.source} · {len(cached.lines)} 行（缓存）", "disk_cached")
         if force:
             self.alias_cache.pop(alias_key, None)
             self.artist_cache.clear()
         self.cache.pop(key, None)
         try:
             self._check()
-            base_aliases = aliases = [track]
+            base_aliases = [track]
+            aliases = self.alias_cache.get(alias_key, base_aliases)
             providers = tuple(getattr(self, "_" + source) for source in order)
             result = self._run_stage(providers[0], aliases, budget=3.)
             if result is None:
                 aliases = self._run_stage(self._aliases, track, storefront, budget=3.) or self.alias_cache.get(alias_key, aliases)
-                result = self._search_sources(aliases, providers if aliases != base_aliases else providers[1:], reserve=2.)
+                result = self._run_stage(self._resolve_candidates, aliases, order, budget=2.)
+                if result is None:
+                    result = self._search_sources(aliases, providers if aliases != base_aliases else providers[1:], reserve=12.)
+            if result is None:
+                expanded = self._run_stage(self._album_aliases, track, storefront, aliases, budget=5.) or aliases
+                if expanded != aliases:
+                    aliases = expanded
+                    result = self._run_stage(self._resolve_candidates, aliases, order, budget=2.)
+                    if result is None:
+                        result = self._search_sources(aliases, providers, reserve=5.)
+            if result is None:
+                plausible = any(not recording_evidence(item.track, aliases).conflict
+                                and recording_evidence(item.track, aliases).fragment
+                                and recording_evidence(item.track, aliases).album for item in self.candidates.values())
+                if plausible and alias_key not in self.apple_records:
+                    try:
+                        self._run_stage(self._artist_catalog, track, storefront, budget=4.)
+                    except (requests.RequestException, ValueError, TypeError, KeyError):
+                        self.failures.add("Apple artist catalog")
+                result = self._run_stage(self._resolve_candidates, aliases, order, deep=True, budget=5.)
             if result is None:
                 expanded = self._run_stage(self._catalog_aliases, aliases, budget=2.) or aliases
                 if expanded != aliases:
@@ -795,26 +1543,33 @@ class LyricsFinder:
                 if len(self.cache) >= 64:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = result
-                return result, f"已匹配 · {result.source} · {len(result.lines)} 行"
+                reply = finish(result, f"已匹配 · {result.source} · {len(result.lines)} 行", "matched")
+                self._cache_lyrics(track, storefront, order, result, self.diagnostics["selected"])
+                return reply
             if self.failures:
-                return None, "部分曲目或歌词查询暂未完成，可重新匹配"
-            return None, "未找到可靠的同步歌词" if self.reachable else "歌词服务暂时不可用，可点击重新匹配"
+                return finish(None, "部分曲目或歌词查询暂未完成，可重新匹配", "incomplete")
+            if self.plain_found:
+                return finish(None, "已找到歌词，但没有时间轴，无法同步滚动", "untimed")
+            if self.uncertain_found:
+                return finish(None, "候选歌手署名或发行版本尚未核实，未自动采用", "unverified")
+            return finish(None, "未找到可靠的同步歌词" if self.reachable else "歌词服务暂时不可用，可点击重新匹配", "not_found")
         except TimeoutError as exc:
-            return None, str(exc)
+            self.failures.add("Search timeout")
+            return finish(None, str(exc), "incomplete")
 
 
-def lyrics_probe(values, report_path):
+def lyrics_probe(values, report_path, album="", cache_dir=None):
     import json
     from pathlib import Path
-    finder = LyricsFinder()
+    finder = LyricsFinder(cache_dir=cache_dir)
     try:
-        track = Track(values[0], values[1], duration=float(values[2]))
+        track = Track(values[0], values[1], album, duration=float(values[2]))
         result, message = finder.find(track)
-        report = dict(ok=result is not None, message=message, source=result.source if result else None,
+        report = dict(ok=result is not None, version=__version__, message=message, source=result.source if result else None,
                       title=result.title if result else None, artist=result.artist if result else None,
                       lines=len(result.lines) if result else 0,
                       first_time=result.lines[0].time if result else None,
-                      last_time=result.lines[-1].time if result else None)
+                      last_time=result.lines[-1].time if result else None, diagnostics=finder.diagnostics)
         if report_path:
             Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(report, ensure_ascii=True), flush=True)

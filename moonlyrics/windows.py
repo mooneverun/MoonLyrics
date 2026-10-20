@@ -13,7 +13,7 @@ import sys
 import time
 
 from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QSurfaceFormat, QVector2D, QVector4D
+from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QSurfaceFormat, QVector2D, QVector4D
 from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLShader, QOpenGLShaderProgram,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
@@ -22,7 +22,9 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGridLayout,
                             QHBoxLayout, QLabel, QMenu, QMessageBox, QProgressBar, QPushButton,
                             QSlider, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, normalized, transparency_amount, lyric_offset_seconds
+from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, FPS_OPTIONS, normalized, transparency_amount, lyric_offset_seconds
+from . import __version__
+from .i18n import LANGUAGES, TEXTS, translate, translate_message
 from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
@@ -49,6 +51,9 @@ client_rect = api(user32, "GetClientRect", W.BOOL, W.HWND, C.POINTER(W.RECT))
 client_origin = api(user32, "ClientToScreen", W.BOOL, W.HWND, C.POINTER(W.POINT))
 set_affinity = api(user32, "SetWindowDisplayAffinity", W.BOOL, W.HWND, W.DWORD)
 get_affinity = api(user32, "GetWindowDisplayAffinity", W.BOOL, W.HWND, C.POINTER(W.DWORD))
+get_window_long = api(user32, "GetWindowLongPtrW", C.c_ssize_t, W.HWND, C.c_int)
+set_window_pos = api(user32, "SetWindowPos", W.BOOL, W.HWND, W.HWND,
+                     C.c_int, C.c_int, C.c_int, C.c_int, W.UINT)
 compatible_dc = api(gdi32, "CreateCompatibleDC", W.HDC, W.HDC)
 delete_dc = api(gdi32, "DeleteDC", W.BOOL, W.HDC)
 select_object = api(gdi32, "SelectObject", W.HANDLE, W.HDC, W.HANDLE)
@@ -74,15 +79,24 @@ dib_section = api(gdi32, "CreateDIBSection", W.HBITMAP, W.HDC, C.POINTER(BitmapI
 class DesktopRegion:
     """Keep one reusable native bitmap; capture only the glass area plus filter padding."""
     def __init__(self):
-        self.screen_dc = get_dc(None)
-        self.memory_dc = compatible_dc(self.screen_dc)
-        if not self.screen_dc or not self.memory_dc:
-            raise C.WinError(C.get_last_error())
+        self.screen_dc = self.memory_dc = None
         self.bitmap = None
         self.old_bitmap = None
         self.bits = C.c_void_p()
         self.size = (0, 0)
         self.bounds = (0., 0., 1., 1.)
+        self.reset()
+
+    def reset(self):
+        self.close()
+        self.screen_dc = get_dc(None)
+        if not self.screen_dc:
+            raise C.WinError(C.get_last_error())
+        self.memory_dc = compatible_dc(self.screen_dc)
+        if not self.memory_dc:
+            error = C.get_last_error()
+            self.close()
+            raise C.WinError(error)
 
     def capture(self, hwnd, pad):
         rect, origin = W.RECT(), W.POINT(0, 0)
@@ -131,6 +145,9 @@ class DesktopRegion:
         if self.screen_dc:
             release_dc(None, self.screen_dc)
             self.screen_dc = None
+        self.old_bitmap = None
+        self.bits = C.c_void_p()
+        self.size = (0, 0)
 
 
 class MemoryCounters(C.Structure):
@@ -387,7 +404,7 @@ class GlassView(QOpenGLWidget):
     def paint_material(self):
         self.gl.glDisable(0x0B71); self.gl.glDisable(0x0BE2); self.gl.glDisable(0x0C11)
         self.gl.glClearColor(0., 0., 0., 0.); self.gl.glClear(0x00004000)
-        if not self.frame_geometry:
+        if not self.frame_geometry or (not self.new_frame and not all(self.texture_size)):
             return
         if self.query_enabled and self.gpu_pending and self.query.isResultAvailable():
             self.gpu_ms = self.query.waitForResult() / 1e6
@@ -396,7 +413,8 @@ class GlassView(QOpenGLWidget):
         if measure:
             self.query.begin()
         self.vao.bind()
-        cw, ch = self.capture.size
+        # Keep the last uploaded texture usable while native capture resources are rebuilt.
+        cw, ch = self.capture.size if self.new_frame else self.texture_size
         self.active_texture(0x84C0)
         self.gl.glBindTexture(0x0DE1, self.texture.value)
         if self.new_frame:
@@ -487,6 +505,7 @@ class GlassView(QOpenGLWidget):
 
 class GlassWindow(QWidget):
     failed = pyqtSignal(str)
+    capture_status_changed = pyqtSignal(bool)
 
     def __init__(self, settings):
         super().__init__()
@@ -504,6 +523,7 @@ class GlassWindow(QWidget):
         self.timer = QTimer(self); self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.refresh)
         self.paused = False
+        self.retry_delay = 0
         self.drag_anchor = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.resize(settings["width"], settings["height"])
@@ -519,21 +539,53 @@ class GlassWindow(QWidget):
                 or value.value != 0x11):
             self.fail("当前系统无法将玻璃条排除在桌面取样之外，已停止刷新以避免画面递归。")
             return
+        self.ensure_topmost(force=True)
         if not self.paused:
-            self.timer.start(round(1000 / self.settings["fps"]))
+            self.timer.start(self.retry_delay or round(1000 / self.settings["fps"]))
         LOG.info("Desktop capture exclusion active; HWND=%s", hwnd)
 
+    def ensure_topmost(self, *, force=False):
+        if not self.isVisible() or self.isMinimized():
+            return False
+        hwnd = int(self.winId())
+        was_topmost = bool(get_window_long(hwnd, -20) & 0x8)
+        if was_topmost and not force:
+            return True
+        # Reassert native Z-order without recreating the window or taking keyboard focus.
+        flags = 0x0001 | 0x0002 | 0x0010 | 0x0200  # NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
+        if not set_window_pos(hwnd, -1, 0, 0, 0, 0, flags):
+            LOG.warning("Could not restore lyric topmost; HWND=%s error=%s", hwnd, C.get_last_error())
+            return False
+        LOG.info("Restored lyric topmost; HWND=%s previous_topmost=%s force=%s", hwnd, was_topmost, force)
+        return True
+
     def refresh(self):
-        if self.isMinimized() or not self.isVisible():
+        if self.paused or self.isMinimized() or not self.isVisible():
             return
         try:
+            if self.retry_delay:
+                self.capture.reset()
             self.view.take_frame()
+        except OSError:
+            self.view.new_frame = False
+            if not self.retry_delay:
+                LOG.exception("Desktop capture unavailable; scheduling automatic recovery")
+                self.capture_status_changed.emit(True)
+            self.retry_delay = min(5000, self.retry_delay * 2 or 1000)
+            self.timer.start(self.retry_delay)
         except Exception as exc:
             LOG.exception("Desktop region capture failed")
             self.fail(str(exc))
+        else:
+            if self.retry_delay:
+                self.retry_delay = 0
+                LOG.info("Desktop capture recovered after rebuilding native resources")
+                self.capture_status_changed.emit(False)
+                self.timer.start(round(1000 / self.settings["fps"]))
 
     def fail(self, message):
         self.paused = True
+        self.retry_delay = 0
         self.timer.stop()
         self.failed.emit(message)
 
@@ -575,6 +627,7 @@ class Controls(SettingsWindow):
         self.setWindowTitle("MoonLyrics · 月光歌词设置")
         self.glass = GlassWindow(settings)
         self.glass.failed.connect(self.failed)
+        self.glass.capture_status_changed.connect(self.capture_status_changed)
         self.error = None
         self.usage = Usage()
         self.samples = []
@@ -591,6 +644,19 @@ class Controls(SettingsWindow):
         self.lyric_debounce.timeout.connect(self.request_lyrics)
         self.closing = False
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
+        self.lyrics_message = "播放歌曲后自动匹配同步歌词"
+        self.runtime_message = "拖动后方的网页或播放视频，可检验真实背景取样。"
+        layout = self.section("通用设置")
+        language_row = QHBoxLayout()
+        language_row.addWidget(QLabel("界面语言"))
+        self.language = QComboBox()
+        self.language.setAccessibleName("界面语言")
+        for code, label in LANGUAGES.items():
+            self.language.addItem(label, code)
+        self.language.setCurrentIndex(self.language.findData(settings["language"]))
+        self.language.currentIndexChanged.connect(self.language_changed)
+        language_row.addWidget(self.language); language_row.addStretch()
+        layout.addLayout(language_row)
         layout = self.section("正在播放")
         self.track_title = QLabel("等待 Apple Music")
         self.track_title.setWordWrap(True)
@@ -629,6 +695,8 @@ class Controls(SettingsWindow):
             if position:
                 source_row.addWidget(QLabel("→"))
             choice = QComboBox()
+            choice.setObjectName("sourceChoice")
+            choice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
             for key, label in LYRIC_SOURCES.items():
                 choice.addItem(label, key)
             choice.setCurrentIndex(choice.findData(source))
@@ -640,6 +708,15 @@ class Controls(SettingsWindow):
         layout.addLayout(source_row)
         self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
         self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
+        cache_row = QHBoxLayout()
+        self.cache_status = QLabel("成功匹配的歌词会自动缓存，下次播放直接读取。")
+        self.cache_status.setObjectName("secondary"); self.cache_status.setWordWrap(True)
+        cache_row.addWidget(self.cache_status, 1)
+        self.clear_lyrics_cache = QPushButton("清空歌词缓存")
+        self.clear_lyrics_cache.setEnabled(media)
+        self.clear_lyrics_cache.setToolTip("清空本地歌词缓存，不影响正在显示的歌词。")
+        self.clear_lyrics_cache.clicked.connect(self.clear_cache)
+        cache_row.addWidget(self.clear_lyrics_cache); layout.addLayout(cache_row)
         timing_caption = QHBoxLayout(); timing_caption.addWidget(QLabel("歌词校准")); timing_caption.addStretch()
         timing_row = QHBoxLayout()
         earlier = QPushButton("提前 0.1 秒"); later = QPushButton("延后 0.1 秒")
@@ -650,7 +727,7 @@ class Controls(SettingsWindow):
         self.lyric_timing = QLabel(); self.lyric_timing.setMinimumWidth(80)
         self.lyric_timing.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lyric_timing.setText(self.offset_label())
-        self.lyric_timing.setToolTip("所有来源默认提前 1 秒，按钮在此基础上微调；重置回到提前 1 秒。\n只校准歌词，不改变歌曲播放进度。")
+        self.lyric_timing.setToolTip("以标准时序为基准微调，重置恢复标准。\n只校准歌词，不改变歌曲播放进度。")
         timing_caption.addWidget(self.lyric_timing); layout.addLayout(timing_caption)
         for widget in (earlier, later, reset_timing): timing_row.addWidget(widget)
         layout.addLayout(timing_row)
@@ -662,11 +739,16 @@ class Controls(SettingsWindow):
         labels = dict(transparency_level="背景透明度", width="玻璃条宽度", height="玻璃条高度")
         for row, (key, label) in enumerate(labels.items()):
             slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(*LIMITS[key]); slider.setValue(settings[key])
+            # One width-slider unit is ten pixels, including dragging and wheel/key input.
+            step = 10 if key == "width" else 1
+            slider.setRange(*(number // step for number in LIMITS[key]))
+            if key == "width": slider.setPageStep(1)
+            slider.setValue(settings[key] // step)
             slider.setAccessibleName(label)
             value = QLabel(); value.setMinimumWidth(56); value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             caption = QLabel(label); caption.setBuddy(slider)
-            def change(number, field=key, readout=value):
+            def change(number, field=key, readout=value, unit=step):
+                number *= unit
                 self.settings[field] = number
                 readout.setText(f"{number}{' px' if field in ('width', 'height') else ' / 10'}")
                 if field == "transparency_level":
@@ -675,15 +757,25 @@ class Controls(SettingsWindow):
                 else:
                     self.glass.resize(self.settings["width"], self.settings["height"])
                 self.glass.refresh()
-            slider.valueChanged.connect(change); change(settings[key])
+            slider.valueChanged.connect(change); change(slider.value())
             self.sliders[key] = slider
             grid.addWidget(caption, row, 0); grid.addWidget(slider, row, 1); grid.addWidget(value, row, 2)
         layout.addLayout(grid)
         self.sliders["transparency_level"].setToolTip("同步调节歌词条和设置面板：1 更浓，10 更通透，切换时柔和过渡。\n设置面板保留系统磨砂，文字与按钮不会一起变淡。")
+        layout.addWidget(QLabel("快捷位置"))
+        positions = QGridLayout()
+        self.position_buttons = []
+        for index, label in enumerate(("左上", "顶部居中", "右上", "左下", "底部居中", "右下")):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, slot=index: self.place_lyrics(slot))
+            positions.addWidget(button, index // 3, index % 3)
+            self.position_buttons.append(button)
+        layout.addLayout(positions)
         row = QHBoxLayout()
         row.addWidget(QLabel("刷新上限")); self.fps = QComboBox()
-        for value in (15, 30, 60): self.fps.addItem(f"{value} FPS", value)
-        self.fps.setCurrentIndex((15, 30, 60).index(settings["fps"]))
+        for value in FPS_OPTIONS: self.fps.addItem(f"{value} FPS", value)
+        self.fps.setCurrentIndex(self.fps.findData(settings["fps"]))
+        self.fps.setToolTip("刷新上限不代表实际帧率，实际表现取决于桌面取样速度与设备性能。")
         self.fps.currentIndexChanged.connect(self.fps_changed); row.addWidget(self.fps)
         row.addStretch(); self.pause = QPushButton("暂停刷新"); self.pause.clicked.connect(self.toggle_pause); row.addWidget(self.pause)
         layout.addLayout(row)
@@ -692,6 +784,7 @@ class Controls(SettingsWindow):
         help_text = QLabel("按住歌词条可拖动；锁定后鼠标可穿透。透明度同时作用于歌词条和设置面板。")
         help_text.setObjectName("secondary"); help_text.setWordWrap(True); layout.addWidget(help_text)
         layout = self.section("运行状态")
+        self.version_label = QLabel(); layout.addWidget(self.version_label)
         self.stats = QLabel("正在测量 CPU、内存与实际帧率…"); self.stats.setWordWrap(True); layout.addWidget(self.stats)
         self.timing = QLabel(); self.timing.setWordWrap(True); layout.addWidget(self.timing)
         self.hardware = QLabel("正在识别显卡…"); self.hardware.setWordWrap(True); layout.addWidget(self.hardware)
@@ -717,13 +810,107 @@ class Controls(SettingsWindow):
         self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
         self.media_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.media_timer.start(33)
+        self.prepare_translations()
+        self.retranslate_ui()
         if media:
-            self.lyrics_worker = LyricsWorker(self)
+            self.lyrics_worker = LyricsWorker(self, cache_dir=APP_DIR / "cache" / "lyrics")
             self.lyrics_worker.result_ready.connect(self.accept_lyrics)
+            self.lyrics_worker.cache_cleared.connect(self.cache_cleared)
             self.lyrics_worker.start()
             self.media_reader = AppleMusicReader(self)
             self.media_reader.snapshot_changed.connect(self.set_playback)
             self.media_reader.start()
+
+    def ui_text(self, source, **values):
+        return translate(self.settings["language"], source, **values)
+
+    def prepare_translations(self):
+        # Bind only static UI text; never translate song titles or replace live status with initial text.
+        dynamic = (self.track_title, self.track_details, self.media_status, self.lyrics_status,
+                   self.lyric_timing, self.stats, self.timing, self.hardware, self.status, self.pause, self.cache_status)
+        self.text_bindings = []
+        objects = [self, self.glass] + self.findChildren(QWidget) + self.findChildren(QAction)
+        for obj in objects:
+            for getter, setter in (("text", "setText"), ("toolTip", "setToolTip"),
+                                   ("accessibleName", "setAccessibleName"), ("windowTitle", "setWindowTitle")):
+                if obj in dynamic and getter == "text":
+                    continue
+                read, write = getattr(obj, getter, None), getattr(obj, setter, None)
+                if callable(read) and callable(write) and read() in TEXTS:
+                    self.text_bindings.append((write, read()))
+
+    def language_changed(self):
+        self.settings["language"] = self.language.currentData()
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        for setter, source in self.text_bindings:
+            setter(self.ui_text(source))
+        for combo in [self.storefront] + self.source_choices:
+            blocked = combo.blockSignals(True)
+            for index in range(combo.count()):
+                key = combo.itemData(index)
+                source = (dict(tr="土耳其", cn="中国大陆", hk="香港", tw="台湾", us="美国")[key]
+                          if combo is self.storefront else LYRIC_SOURCES[key])
+                combo.setItemText(index, self.ui_text(source))
+            combo.blockSignals(blocked)
+        for position, choice in enumerate(self.source_choices):
+            choice.setAccessibleName(self.ui_text("第 {position} 优先歌词源", position=position + 1))
+        self.version_label.setText(self.ui_text("版本：{version}", version=__version__))
+        self.cache_status.setText(self.ui_text(getattr(self, "cache_message", "成功匹配的歌词会自动缓存，下次播放直接读取。")))
+        self.tray.setToolTip(self.ui_text("MoonLyrics · 月光歌词"))
+        self.lyric_timing.setText(self.offset_label())
+        self.set_lyrics_status(self.lyrics_message)
+        document = self.glass.view.lyrics
+        if document is not None:
+            self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {self.ui_text(document.source)}")
+        self.render_runtime_status()
+        self.pause.setText(self.ui_text("重试刷新" if self.error else "继续刷新" if self.glass.paused else "暂停刷新"))
+        self.update_track_labels()
+        self.update_playback_display()
+        self.render_stats()
+
+    def update_track_labels(self):
+        self.track_title.setText(self.playback.title or self.ui_text("等待 Apple Music"))
+        self.track_details.setText(" · ".join(value for value in (self.playback.artist, self.playback.album) if value)
+                                   or self.ui_text("打开 Apple Music 并播放一首歌曲"))
+
+    def set_lyrics_status(self, message):
+        self.lyrics_message = message
+        self.lyrics_status.setText(translate_message(self.settings["language"], message))
+
+    def clear_cache(self):
+        if self.lyrics_worker is None:
+            return
+        self.lyric_debounce.stop()
+        self.lyric_request += 1
+        self.clear_lyrics_cache.setEnabled(False)
+        self.cache_message = "正在清空歌词缓存…"
+        self.cache_status.setText(self.ui_text(self.cache_message))
+        self.lyrics_worker.clear_cache()
+
+    def cache_cleared(self, success):
+        if self.closing:
+            return
+        self.clear_lyrics_cache.setEnabled(True)
+        self.cache_message = "歌词缓存已清空" if success else "缓存暂时无法清空，请稍后重试"
+        self.cache_status.setText(self.ui_text(self.cache_message))
+        if self.glass.view.lyrics is None:
+            self.set_lyrics_status("可点击重新匹配获取当前歌曲的歌词")
+
+    def render_runtime_status(self):
+        message = translate_message(self.settings["language"], self.error or self.runtime_message)
+        self.status.setText(self.ui_text("已停止刷新：{message}", message=message) if self.error else message)
+
+    def place_lyrics(self, position):
+        screen = QApplication.screenAt(self.glass.frameGeometry().center()) or self.glass.screen()
+        bounds = screen.availableGeometry()
+        space_x, space_y = max(0, bounds.width() - self.glass.width()), max(0, bounds.height() - self.glass.height())
+        margin_x, margin_y = min(24, space_x // 2), min(24, space_y // 2)
+        x = (margin_x, space_x // 2, space_x - margin_x)[position % 3]
+        y = (margin_y, space_y - margin_y)[position // 3]
+        self.glass.move(bounds.left() + x, bounds.top() + y)
+        self.glass.ensure_topmost(force=True)
 
     def minimize_settings(self):
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -734,6 +921,7 @@ class Controls(SettingsWindow):
     def restore_settings(self):
         if not self.closing:
             self.showNormal(); self.raise_(); self.activateWindow()
+            self.glass.ensure_topmost(force=True)
 
     def tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -748,11 +936,13 @@ class Controls(SettingsWindow):
     def set_playback(self, snapshot):
         if self.closing:
             return
+        if snapshot.status == "playing" and self.playback.status != "playing":
+            self.glass.ensure_topmost(force=True)
+            if self.glass.retry_delay:
+                self.glass.refresh()
         self.playback = snapshot
         self.lyric_clock.update(snapshot)
-        self.track_title.setText(snapshot.title or "等待 Apple Music")
-        self.track_details.setText(" · ".join(value for value in (snapshot.artist, snapshot.album) if value)
-                                   or "打开 Apple Music 并播放一首歌曲")
+        self.update_track_labels()
         self.media_status.setToolTip(snapshot.message)
         if (self.matching_key(snapshot) != self.lyric_key
                 or snapshot.duration > 0 and abs(snapshot.duration - self.lyric_duration) > 1.):
@@ -796,7 +986,7 @@ class Controls(SettingsWindow):
         valid = self.lyric_key[-1]
         self.retry_lyrics.setEnabled(valid and self.lyrics_worker is not None)
         self.lyrics_status.setToolTip("")
-        self.lyrics_status.setText(("等待歌曲信息稳定…" if defer else "正在匹配歌词…") if valid else "等待完整的歌曲信息")
+        self.set_lyrics_status(("等待歌曲信息稳定…" if defer else "正在匹配歌词…") if valid else "等待完整的歌曲信息")
         track = Track(snapshot.title, snapshot.artist, snapshot.album, self.lyric_duration) if valid else None
         if self.lyrics_worker is not None:
             self.lyrics_worker.request(self.lyric_request, None if defer else track, self.settings["storefront"], force,
@@ -807,16 +997,15 @@ class Controls(SettingsWindow):
     def accept_lyrics(self, request_id, document, message):
         if self.closing or request_id != self.lyric_request:
             return
-        self.lyrics_status.setText(message)
+        self.set_lyrics_status(message)
         self.glass.view.set_lyrics(document, self.lyric_clock.position_at() + lyric_offset_seconds(self.settings))
         if document is not None:
-            self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {document.source}")
+            self.lyrics_status.setToolTip(f"{document.title} — {document.artist} · {self.ui_text(document.source)}")
         self.update_playback_display()
 
     def offset_label(self):
-        offset = lyric_offset_seconds(self.settings)
-        label = f"{'提前' if offset > 0 else '延后'} {abs(offset):.1f} 秒" if offset else "原始时序"
-        return label + "（默认）" if self.settings["lyric_offset_ms"] == DEFAULTS["lyric_offset_ms"] else label
+        offset = (self.settings["lyric_offset_ms"] - DEFAULTS["lyric_offset_ms"]) / 1000
+        return self.ui_text("提前 {seconds:.1f} 秒" if offset > 0 else "延后 {seconds:.1f} 秒", seconds=abs(offset)) if offset else self.ui_text("标准")
 
     def change_lyric_offset(self, delta):
         lo, hi = LIMITS["lyric_offset_ms"]
@@ -827,20 +1016,20 @@ class Controls(SettingsWindow):
     def update_playback_display(self):
         snapshot = self.playback
         position = snapshot.position_at()
-        state = STATUS_LABELS.get(snapshot.status, "等待播放")
+        state = self.ui_text(STATUS_LABELS.get(snapshot.status, "等待播放"))
         timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
         self.media_status.setText(state); self.media_time.setText(timing)
         self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
         self.glass.view.set_lyric_time(self.lyric_clock.position_at() + lyric_offset_seconds(self.settings))
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
-        secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else "播放音乐后显示歌曲与进度"
+        secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else self.ui_text("播放音乐后显示歌曲与进度")
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
             self.glass.view.primary_text, self.glass.view.secondary_text = primary, secondary
             self.glass.view.update()
 
     def fps_changed(self):
         self.settings["fps"] = self.fps.currentData()
-        if not self.glass.paused:
+        if not self.glass.paused and not self.glass.retry_delay:
             self.glass.timer.start(round(1000 / self.settings["fps"]))
 
     def toggle_pause(self):
@@ -848,17 +1037,27 @@ class Controls(SettingsWindow):
         if self.glass.paused:
             self.glass.timer.stop()
         else:
+            if self.error:
+                self.capture_status_changed(bool(self.glass.retry_delay))
             self.glass.protect()
-        self.pause.setText("继续刷新" if self.glass.paused else "暂停刷新")
+        self.pause.setText(self.ui_text("重试刷新" if self.error else "继续刷新" if self.glass.paused else "暂停刷新"))
+
+    def capture_status_changed(self, retrying):
+        self.error = None
+        self.runtime_message = "桌面取样暂时不可用，正在自动恢复…" if retrying else "桌面取样已恢复。"
+        self.render_runtime_status()
+        self.status.setObjectName("secondary")
+        self.status.style().unpolish(self.status); self.status.style().polish(self.status)
 
     def failed(self, message):
         self.error = message
-        self.status.setText("已停止刷新：" + message)
+        self.render_runtime_status()
         self.status.setObjectName("errorStatus")
         self.status.style().unpolish(self.status); self.status.style().polish(self.status)
-        self.pause.setText("重试刷新")
+        self.pause.setText(self.ui_text("重试刷新"))
 
     def sample(self):
+        self.glass.ensure_topmost()
         cpu, memory = self.usage.read()
         now = time.perf_counter(); view = self.glass.view
         fps = (view.frames - self.last_frames) / max(.01, now - self.last_sample_time)
@@ -866,10 +1065,19 @@ class Controls(SettingsWindow):
         sample = dict(cpu=cpu, memory_mb=memory, fps=fps, capture_ms=view.capture_ms, gpu_ms=view.gpu_ms)
         self.samples.append(sample)
         self.samples = self.samples[-120:]
-        self.stats.setText(f"CPU  {cpu:.2f}%     内存  {memory:.1f} MB     实际帧率  {fps:.1f} FPS")
+        self.render_stats()
+
+    def render_stats(self):
+        view = self.glass.view
+        if not self.samples:
+            self.stats.setText(self.ui_text("正在测量 CPU、内存与实际帧率…"))
+            self.hardware.setText(self.ui_text("正在识别显卡…"))
+            return
+        sample = self.samples[-1]
+        self.stats.setText(self.ui_text("CPU  {cpu:.2f}%     内存  {memory_mb:.1f} MB     实际帧率  {fps:.1f} FPS", **sample))
         gpu = "—" if view.gpu_ms is None else f"{view.gpu_ms:.2f} ms"
-        self.timing.setText(f"桌面取样  {view.capture_ms:.2f} ms / 帧     GPU 材质绘制  {gpu}")
-        self.hardware.setText("显卡：" + view.renderer)
+        self.timing.setText(self.ui_text("桌面取样  {capture_ms:.2f} ms / 帧     GPU 材质绘制  {gpu}", capture_ms=view.capture_ms, gpu=gpu))
+        self.hardware.setText(self.ui_text("显卡：{renderer}", renderer=self.ui_text(view.renderer)))
 
     def closeEvent(self, event):
         self.closing = True
@@ -878,7 +1086,7 @@ class Controls(SettingsWindow):
         for reader in readers:
             reader.stop()
         if any(not reader.wait(100) for reader in readers):
-            self.lyrics_status.setText("正在结束后台请求…")
+            self.set_lyrics_status("正在结束后台请求…")
             event.ignore(); QTimer.singleShot(100, self.close)
             return
         self.media_timer.stop()
@@ -896,6 +1104,7 @@ class Controls(SettingsWindow):
 
 
 def self_test(app, control, report_path, preview_path):
+    from unittest.mock import patch
     from PyQt6.QtTest import QTest
     from PyQt6.QtGui import QImage
     from PIL import Image, ImageChops, ImageFilter, ImageStat
@@ -926,12 +1135,12 @@ def self_test(app, control, report_path, preview_path):
 
     def parameters(**values):
         for key, number in values.items():
-            if key == "fps": control.fps.setCurrentIndex((15, 30, 60).index(number))
+            if key == "fps": control.fps.setCurrentIndex(control.fps.findData(number))
             elif key == "preset":
                 material = PRESETS[number]
                 control.settings.update(preset=number, blur=material["blur"], refraction=material["refraction"])
             elif key in ("blur", "refraction"): control.settings[key] = number
-            else: control.sliders[key].setValue(number)
+            else: control.sliders[key].setValue(number // (10 if key == "width" else 1))
         control.glass.refresh(); QTest.qWait(300)
         assert control.error is None, control.error
 
@@ -979,6 +1188,36 @@ def self_test(app, control, report_path, preview_path):
         difference = sum(abs(a - b) for a, b in zip(baseline, after)) / len(baseline)
         assert difference < .05, f"Capture includes overlay or changing background: {difference}"
         result["capture_exclusion_mean_byte_difference"] = difference
+        frame_count = glass.view.frames
+
+        def denied(*args):
+            C.set_last_error(5)
+            return False
+
+        with patch("moonlyrics.windows.bit_blt", side_effect=denied):
+            glass.refresh()
+        assert glass.retry_delay == 1000 and glass.timer.isActive() and not glass.paused
+        # Also exercise repainting the retained GPU texture while rebuilding the desktop DC fails.
+        with patch("moonlyrics.windows.get_dc", return_value=0):
+            QTest.qWait(1200)
+            assert glass.retry_delay == 2000 and glass.capture.size == (0, 0)
+            image()
+            assert glass.view.ready and control.error is None
+        calibration.pattern = "vertical"; calibration.update()
+        deadline = time.perf_counter() + 3
+        while glass.retry_delay and time.perf_counter() < deadline:
+            QTest.qWait(50)
+        assert glass.retry_delay == 0 and glass.timer.isActive() and not glass.paused
+        assert glass.view.frames > frame_count and glass.view.ready and control.error is None
+        assert "已恢复" in control.status.text() and control.status.objectName() != "errorStatus"
+        fresh = C.string_at(glass.capture.bits, len(baseline))
+        assert sum(abs(a - b) for a, b in zip(baseline, fresh)) / len(baseline) > 5, "Recovered capture still contains the old background"
+        affinity = W.DWORD()
+        assert get_affinity(int(glass.winId()), C.byref(affinity)) and affinity.value == 0x11
+        result["capture_recovery"] = dict(access_denied=True, automatic_retry=True, native_resources_rebuilt=True,
+                                            retained_texture=True, fresh_background=True, exclusion_preserved=True)
+        glass.timer.stop()
+        calibration.pattern = "checker"; calibration.update(); QTest.qWait(100)
         parameters(blur=0, refraction=0); sharp = image()
         fw, fh, pad = glass.view.frame_geometry
         raw_frame = Image.frombytes("RGB", glass.capture.size,
@@ -1062,7 +1301,7 @@ def self_test(app, control, report_path, preview_path):
             samples = list(control.samples)
             result["profiles"][name] = {key: statistics.mean(s[key] for s in samples if s[key] is not None)
                                         for key in samples[0] if any(s[key] is not None for s in samples)}
-        parameters(preset="rich", transparency_level=1, width=583, height=80, fps=30)
+        parameters(preset="rich", transparency_level=1, width=580, height=80, fps=30)
         control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
                                              album="播放信息测试", status="paused", position=64., duration=270.))
         assert control.media_time.text() == "1:04 / 4:30"
@@ -1083,19 +1322,18 @@ def self_test(app, control, report_path, preview_path):
         control.media_timer.stop()
         control.lyric_debounce.stop()
         control.change_lyric_offset(DEFAULTS["lyric_offset_ms"] - control.settings["lyric_offset_ms"])
-        assert control.lyric_timing.text() == "提前 1.0 秒（默认）"
+        assert control.lyric_timing.text() == "标准"
         document = Lyrics((LyricLine(60., "上面一行轻轻隐去"), LyricLine(64., "中间一行清晰显示"),
-                           LyricLine(68., "下面一行渐渐出现"), LyricLine(72., "下一句等待时光")), "测试")
+                           LyricLine(68., "下面一行渐渐出现"), LyricLine(72., "下一句等待时光")), "LRCLIB")
         control.lyric_request = 8
         control.accept_lyrics(7, document, "旧请求")
         assert glass.view.lyrics is None, "An old song replaced the current lyrics"
-        control.accept_lyrics(8, document, "已匹配 · 测试")
+        control.accept_lyrics(8, document, "已匹配 · LRCLIB · 4 行")
         assert glass.view.lyric_index == 1
         glass.view.set_lyric_time(67.725)
         assert abs(glass.view.scroll_position - 1.5) < 1e-7, "Lyric movement did not ease in before the cue"
         glass.view.set_lyric_time(68.)
         assert glass.view.scroll_position == 2.
-        from unittest.mock import patch
         base = time.perf_counter()
         scroll_samples = []
         def playback_at(position, elapsed, status="playing"):
@@ -1114,13 +1352,13 @@ def self_test(app, control, report_path, preview_path):
         playback_at(67.9, .8, "paused")
         assert glass.view.lyric_index == 1
         control.change_lyric_offset(100)
-        assert glass.view.lyric_index == 2 and control.lyric_timing.text() == "提前 1.1 秒"
+        assert glass.view.lyric_index == 2 and control.lyric_timing.text() == "提前 0.1 秒"
         control.change_lyric_offset(-100)
         assert glass.view.lyric_index == 1
         control.change_lyric_offset(-1000)
-        assert control.lyric_timing.text() == "原始时序"
+        assert control.lyric_timing.text() == "延后 1.0 秒"
         next(button for button in control.findChildren(QPushButton) if button.text() == "重置").click()
-        assert control.settings["lyric_offset_ms"] == 1000 and control.lyric_timing.text() == "提前 1.0 秒（默认）"
+        assert control.settings["lyric_offset_ms"] == 1000 and control.lyric_timing.text() == "标准"
         result["calibration_base_advance_seconds"] = lyric_offset_seconds(control.settings)
         playback_at(64.1, .9, "paused")
         QTest.qWait(100)
@@ -1139,6 +1377,8 @@ def self_test(app, control, report_path, preview_path):
         result["lyrics_viewport"] = dict(clipped=True, edge_fade=True, center_emphasis=True,
                                          animated_scroll=True, seek_and_pause=True, stale_result_rejected=True,
                                          jitter_no_rewind=True, arrives_on_cue=True, timing_calibration=True)
+        # Desktop sampling was verified above; keep it out of settings animation timing checks.
+        glass.timer.stop()
         from .settings_ui import MATERIALS
         assert not app.windowIcon().isNull() and not control.windowIcon().isNull()
         control.move(screen.right() - control.width() - 30, screen.top() + 30)
@@ -1197,6 +1437,28 @@ def self_test(app, control, report_path, preview_path):
         result["settings_ui"] = dict(fixed_material=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
                                       native_backdrop=control.backdrop_active, native_corner_tint=True,
                                       shared_transparency=True, tray_minimize_restore=tray_available, taskbar_fallback=True)
+        for language in LANGUAGES:
+            control.language.setCurrentIndex(control.language.findData(language)); QTest.qWait(100)
+            assert control.scroll.widget().width() <= control.scroll.viewport().width(), f"Settings overflow in {language}"
+            assert control.retry_lyrics.text() == translate(language, "重新匹配")
+            assert control.lyric_timing.text() == translate(language, "标准")
+            assert __version__ in control.version_label.text()
+            if preview_path:
+                control.scroll.widget().grab().save(str(preview_path.with_name(f"settings-{language}.png")))
+        control.language.setCurrentIndex(control.language.findData("zh_CN"))
+        control.fps.setCurrentIndex(control.fps.findData(120))
+        assert control.settings["fps"] == 120 and glass.timer.interval() == round(1000 / 120)
+        QTest.qWait(200)
+        control.fps.setCurrentIndex(control.fps.findData(30)); glass.timer.stop()
+        assert control.version_label.isVisibleTo(control.scroll)
+        location = glass.pos()
+        bounds = glass.screen().availableGeometry()
+        for button in control.position_buttons:
+            button.click()
+            assert bounds.contains(glass.geometry()), "A quick position put the lyric bar outside the work area"
+        glass.move(location)
+        result["settings_controls"] = dict(languages=list(LANGUAGES), width_step_px=10, max_fps=120,
+                                           calibration_standard=True, quick_positions=6, version=__version__)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
@@ -1225,6 +1487,7 @@ def main():
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--media-probe", action="store_true")
     parser.add_argument("--lyrics-probe", nargs=3, metavar=("TITLE", "ARTIST", "SECONDS"))
+    parser.add_argument("--lyrics-album", default="", help=argparse.SUPPRESS)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--preview", type=Path)
     args = parser.parse_args()
@@ -1249,7 +1512,7 @@ def main():
     if args.media_probe:
         return media_probe(app, args.report)
     if args.lyrics_probe:
-        return lyrics_probe(args.lyrics_probe, args.report)
+        return lyrics_probe(args.lyrics_probe, args.report, args.lyrics_album, APP_DIR / "cache" / "lyrics")
     settings = dict(DEFAULTS)
     if not args.self_test:
         for directory in (APP_DIR, LEGACY_DIR):
@@ -1266,7 +1529,7 @@ def main():
         return app.exec()
     except Exception as exc:
         LOG.exception("Startup failed")
-        if not args.self_test: QMessageBox.critical(None, "MoonLyrics 无法启动", str(exc))
+        if not args.self_test: QMessageBox.critical(None, translate(settings["language"], "MoonLyrics 无法启动"), translate_message(settings["language"], str(exc)))
         return 1
 
 

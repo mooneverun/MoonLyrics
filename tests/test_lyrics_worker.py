@@ -43,7 +43,14 @@ class WorkerTests(TestCase):
         self.assertIn("自动重试", results[0][2])
         self.assertIs(results[1][1], document)
         self.assertEqual(finder.find.call_count, 2)
-        self.assertTrue(finder.find.call_args_list[1].args[3])
+        self.assertFalse(finder.find.call_args_list[1].args[3], "Automatic retry must preserve verified metadata")
+
+    def test_structural_miss_is_reported_without_repeating_the_same_search(self):
+        finder = Mock(retryable=False)
+        finder.find.return_value = (None, "未找到可靠的同步歌词")
+        results = self.run_worker(finder, 1)
+        self.assertEqual(finder.find.call_count, 1)
+        self.assertNotIn("自动重试", results[0][2])
 
     def test_missing_lyrics_have_a_bounded_retry_count(self):
         finder = Mock()
@@ -136,3 +143,41 @@ class WorkerTests(TestCase):
         self.assertEqual([result[0] for result in results], [1, 2])
         self.assertIs(results[-1][1], document)
         self.assertEqual(finder.find.call_count, 2)
+
+    def test_cache_clear_cancels_inflight_results_and_runs_on_the_worker(self):
+        app = QCoreApplication.instance() or QCoreApplication([])
+        entered, release = threading.Event(), threading.Event()
+        finder = Mock()
+        finder.clear_cache.return_value = True
+        def find(track, storefront, cancelled, force, source_order):
+            entered.set()
+            if not release.wait(1):
+                raise RuntimeError("Test did not release search")
+            if cancelled():
+                raise SearchCancelled()
+            return None, "未找到可靠的同步歌词"
+        finder.find.side_effect = find
+        results, cleared, clear_threads = [], [], []
+        finder.clear_cache.side_effect = lambda: clear_threads.append(threading.get_ident()) or True
+        with patch("moonlyrics.lyrics_worker.LyricsFinder", return_value=finder) as factory:
+            worker = LyricsWorker(cache_dir="isolated-cache")
+            worker.result_ready.connect(lambda *result: results.append(result))
+            worker.cache_cleared.connect(cleared.append)
+            worker.start()
+            try:
+                worker.request(1, Track("月光", "歌手", duration=100), "tr")
+                self.assertTrue(entered.wait(1))
+                worker.clear_cache()
+                release.set()
+                deadline = time.monotonic() + 2
+                while not cleared and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertEqual(cleared, [True])
+                self.assertEqual(results, [])
+                self.assertNotEqual(clear_threads, [threading.get_ident()])
+                factory.assert_called_once_with(cache_dir="isolated-cache")
+                finder.clear_cache.assert_called_once()
+            finally:
+                release.set(); worker.stop()
+                self.assertTrue(worker.wait(1000))
+        finder.close.assert_called_once()

@@ -1,12 +1,14 @@
 """Platform-independent glass material and settings."""
 import math
+from .i18n import LANGUAGES
 
 PRESETS = {
     "rich": dict(label="凝润", description="细腻的浓磨砂，让繁杂背景更安静。", blur=38, refraction=2),
 }
 LYRIC_SOURCES = {"kugou": "酷狗", "lrclib": "LRCLIB", "netease": "网易云", "qq": "QQ音乐"}
+FPS_OPTIONS = (15, 30, 60, 120)
 DEFAULTS = dict(preset="rich", blur=PRESETS["rich"]["blur"], refraction=PRESETS["rich"]["refraction"],
-                transparency_level=1, width=583, height=80, fps=30, storefront="tr", lyric_offset_ms=1000, lyric_timing_version=1,
+                transparency_level=1, width=580, height=80, fps=30, storefront="tr", language="zh_CN", lyric_offset_ms=1000, lyric_timing_version=1,
                 lyric_source_order=tuple(LYRIC_SOURCES))
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
 
@@ -33,8 +35,11 @@ def normalized(values):
         previous = values.get("transparency")
         if isinstance(previous, (int, float)) and math.isfinite(previous):
             result["transparency_level"] = round(1 + (max(90, min(100, previous)) - 90) * .9)
-    if values.get("fps") in (15, 30, 60):
+    result["width"] = (result["width"] + 5) // 10 * 10
+    if values.get("fps") in FPS_OPTIONS:
         result["fps"] = int(values["fps"])
+    if isinstance(values.get("language"), str) and values["language"] in LANGUAGES:
+        result["language"] = values["language"]
     if values.get("storefront") in ("tr", "cn", "hk", "tw", "us"):
         result["storefront"] = values["storefront"]
     result["lyric_source_order"] = normalized_source_order(values.get("lyric_source_order"))

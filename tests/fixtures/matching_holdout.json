@@ -1,0 +1,224 @@
+{
+  "selection": "Fixed before implementation; no provider matching results were used for selection. Original studio recordings selected from public Apple TR catalog.",
+  "cases": [
+    {
+      "apple_id": 1721455873,
+      "input": {
+        "title": "Blue and White Porcelain",
+        "artist": "Jay Chou",
+        "album": "Jay Chou On The Run",
+        "duration": 239.347
+      }
+    },
+    {
+      "apple_id": 1081381268,
+      "input": {
+        "title": "你不是真正的快樂",
+        "artist": "Mayday",
+        "album": "後 青春期的詩",
+        "duration": 299.907
+      }
+    },
+    {
+      "apple_id": 908972123,
+      "input": {
+        "title": "喜歡你",
+        "artist": "G.E.M.",
+        "album": "喜歡你 - Single",
+        "duration": 239.01
+      }
+    },
+    {
+      "apple_id": 1229073406,
+      "input": {
+        "title": "Through the Night",
+        "artist": "IU",
+        "album": "Palette",
+        "duration": 253.293
+      }
+    },
+    {
+      "apple_id": 1596529381,
+      "input": {
+        "title": "Spring Day",
+        "artist": "BTS",
+        "album": "YOU NEVER WALK ALONE",
+        "duration": 274.097
+      }
+    },
+    {
+      "apple_id": 1339623399,
+      "input": {
+        "title": "LOVE SCENARIO",
+        "artist": "iKON",
+        "album": "Return",
+        "duration": 209.648
+      }
+    },
+    {
+      "apple_id": 1490256995,
+      "input": {
+        "title": "夜に駆ける",
+        "artist": "YOASOBI",
+        "album": "夜に駆ける - Single",
+        "duration": 261.013
+      }
+    },
+    {
+      "apple_id": 1537460612,
+      "input": {
+        "title": "Lemon",
+        "artist": "Kenshi Yonezu",
+        "album": "Lemon - Single",
+        "duration": 256.116
+      }
+    },
+    {
+      "apple_id": 1499386265,
+      "input": {
+        "title": "Blinding Lights",
+        "artist": "The Weeknd",
+        "album": "After Hours",
+        "duration": 200.046
+      }
+    },
+    {
+      "apple_id": 1762656732,
+      "input": {
+        "title": "Die With A Smile",
+        "artist": "Lady Gaga & Bruno Mars",
+        "album": "Die With A Smile - Single",
+        "duration": 251.668
+      }
+    },
+    {
+      "apple_id": 499332705,
+      "input": {
+        "title": "Şımarık",
+        "artist": "Tarkan",
+        "album": "Ölürüm Sana",
+        "duration": 235.218
+      }
+    },
+    {
+      "apple_id": 696699513,
+      "input": {
+        "title": "Dudu",
+        "artist": "Tarkan",
+        "album": "Dudu",
+        "duration": 277.917
+      }
+    }
+  ],
+  "fresh_selection": "Fixed before changing the adoption duration guard, after auditing the initial cohort. No lyric-provider results were used to select these songs. Includes one acoustic recording.",
+  "fresh_cases": [
+    {
+      "apple_id": 1721460924,
+      "input": {
+        "title": "Rice Field",
+        "artist": "Jay Chou",
+        "album": "Capricorn",
+        "duration": 223.453
+      }
+    },
+    {
+      "apple_id": 542923776,
+      "input": {
+        "title": "十年",
+        "artist": "Eason Chan",
+        "album": "黑.白.灰",
+        "duration": 205.424
+      }
+    },
+    {
+      "apple_id": 1694849138,
+      "input": {
+        "title": "Practice Love",
+        "artist": "JJ Lin",
+        "album": "Stories Untold",
+        "duration": 287.0
+      }
+    },
+    {
+      "apple_id": 1550907178,
+      "input": {
+        "title": "Celebrity",
+        "artist": "IU",
+        "album": "Celebrity - Single",
+        "duration": 195.533
+      }
+    },
+    {
+      "apple_id": 1398185834,
+      "input": {
+        "title": "DDU-DU DDU-DU",
+        "artist": "BLACKPINK",
+        "album": "SQUARE UP - EP",
+        "duration": 211.35
+      }
+    },
+    {
+      "apple_id": 1596532400,
+      "input": {
+        "title": "Dynamite",
+        "artist": "BTS",
+        "album": "BE",
+        "duration": 199.054
+      }
+    },
+    {
+      "apple_id": 1528119630,
+      "input": {
+        "title": "Gunjou",
+        "artist": "YOASOBI",
+        "album": "Gunjou - Single",
+        "duration": 248.444
+      }
+    },
+    {
+      "apple_id": 1459216694,
+      "input": {
+        "title": "Pretender",
+        "artist": "OFFICIAL HIGE DANDISM",
+        "album": "Pretender - Single",
+        "duration": 326.44
+      }
+    },
+    {
+      "apple_id": 1202046879,
+      "input": {
+        "title": "Shape of You (Acoustic)",
+        "artist": "Ed Sheeran",
+        "album": "Shape of You (Acoustic) - Single",
+        "duration": 223.573
+      }
+    },
+    {
+      "apple_id": 1574968888,
+      "input": {
+        "title": "STAY",
+        "artist": "The Kid LAROI & Justin Bieber",
+        "album": "STAY - Single",
+        "duration": 141.806
+      }
+    },
+    {
+      "apple_id": 499334149,
+      "input": {
+        "title": "Kuzu Kuzu",
+        "artist": "Tarkan",
+        "album": "Karma",
+        "duration": 233.639
+      }
+    },
+    {
+      "apple_id": 1651938428,
+      "input": {
+        "title": "Antidepresan",
+        "artist": "Mert Demir & Mabel Matiz",
+        "album": "Antidepresan - Single",
+        "duration": 240.125
+      }
+    }
+  ]
+}

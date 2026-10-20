@@ -56,6 +56,24 @@ class ParserTests(TestCase):
 
 
 class MatchingTests(TestCase):
+    def test_embedded_chinese_title_readings_match_in_both_directions(self):
+        for titled, plain in (("飞(FEY)1999", "飞1999"), ("飛［FEY］1999", "飞1999"),
+                               ("月(YUE)光", "月光"), ("爱 (AI) 2025", "爱2025")):
+            left, right = Track(titled, "Luna", duration=100), Track(plain, "Luna", duration=100.95)
+            self.assertIsNotNone(match_rank(left, [right]), titled)
+            self.assertIsNotNone(match_rank(right, [left]), titled)
+
+    def test_reading_normalization_preserves_versions_numbers_and_complete_artists(self):
+        target = Track("飞(FEY)1999", "99 God", duration=98)
+        for title in ("飞1998", "飞(Live)1999", "飞(Remix)1999", "飞(DJ)1999",
+                      "飞(Instrumental)1999", "飞(Cover)1999", "飞1999 (feat. Guest)"):
+            self.assertIsNone(match_rank(Track(title, "99 God", duration=98), [target]), title)
+        self.assertIsNone(match_rank(Track("飞1999", "Another Artist", duration=98), [target]))
+        self.assertIsNone(match_rank(Track("飞1999", "99 God", duration=118), [target]))
+        self.assertIsNone(match_rank(Track("飞1999", "99 God", duration=0), [target]))
+        for titled, plain in (("Fly(FEY)1999", "Fly1999"), ("飞(FEY)", "飞")):
+            self.assertIsNone(match_rank(Track(titled, "Luna", duration=100), [Track(plain, "Luna", duration=100)]))
+
     def test_attached_and_nested_feature_credits_preserve_recording_versions(self):
         for title in ("Moonlight (feat.Guest)", "Moonlight [ft.Guest]", "Moonlight (with Guest)"):
             self.assertIsNotNone(match_rank(Track(title, "Luna", duration=100),

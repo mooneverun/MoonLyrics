@@ -1,0 +1,1573 @@
+[
+  {
+    "apple_album_id": 1781226042,
+    "source_album_id": 253402661,
+    "apple": [
+      {
+        "kind": "song",
+        "trackId": 1781226472,
+        "trackName": "DARKEST VALLEY (INTRO)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 181765,
+        "collectionId": 1781226042,
+        "trackNumber": 1,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226489,
+        "trackName": "SHEPHERD",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 170769,
+        "collectionId": 1781226042,
+        "trackNumber": 2,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226496,
+        "trackName": "TOWER OF BABEL",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 218824,
+        "collectionId": 1781226042,
+        "trackNumber": 3,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226632,
+        "trackName": "MARIA",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 177969,
+        "collectionId": 1781226042,
+        "trackNumber": 4,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226636,
+        "trackName": "INTO THE BRIGHT (feat. 99 God)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 202000,
+        "collectionId": 1781226042,
+        "trackNumber": 5,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226641,
+        "trackName": "BEKSINSKI",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 164000,
+        "collectionId": 1781226042,
+        "trackNumber": 6,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226643,
+        "trackName": "GLORY (feat. 丁山)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 304000,
+        "collectionId": 1781226042,
+        "trackNumber": 7,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226859,
+        "trackName": "MOTHER‘S BLESSING (SKIT)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 107907,
+        "collectionId": 1781226042,
+        "trackNumber": 8,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226862,
+        "trackName": "STARLIGHT (feat. PO8)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 221538,
+        "collectionId": 1781226042,
+        "trackNumber": 9,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226865,
+        "trackName": "BURNING",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 181678,
+        "collectionId": 1781226042,
+        "trackNumber": 10,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226873,
+        "trackName": "WHEN THE ANGEL SINGS",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 170769,
+        "collectionId": 1781226042,
+        "trackNumber": 11,
+        "discNumber": 1,
+        "trackCount": 12
+      },
+      {
+        "kind": "song",
+        "trackId": 1781226883,
+        "trackName": "THE SIGNAL (OUTRO)",
+        "artistName": "11 JIAYI",
+        "collectionName": "SHEPHERD",
+        "trackTimeMillis": 201538,
+        "collectionId": 1781226042,
+        "trackNumber": 12,
+        "discNumber": 1,
+        "trackCount": 12
+      }
+    ],
+    "songs": [
+      {
+        "id": 2645477580,
+        "name": "死荫的幽谷",
+        "duration": 181764,
+        "no": 1,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": [
+          "INTRO"
+        ]
+      },
+      {
+        "id": 2645477573,
+        "name": "牧羊人",
+        "duration": 170769,
+        "no": 2,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2098482267,
+        "name": "巴别塔",
+        "duration": 218823,
+        "no": 3,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645475898,
+        "name": "玛丽亚",
+        "duration": 177968,
+        "no": 4,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645477575,
+        "name": "INTO THE BRIGHT",
+        "duration": 202000,
+        "no": 5,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 31511662,
+            "name": "99 God",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645475900,
+        "name": "贝克辛斯基",
+        "duration": 164000,
+        "no": 6,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645475959,
+        "name": "GLORY",
+        "duration": 304000,
+        "no": 7,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645477509,
+        "name": "母亲的祝福",
+        "duration": 107906,
+        "no": 8,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": [
+          "SKIT"
+        ]
+      },
+      {
+        "id": 2645477570,
+        "name": "STARLIGHT",
+        "duration": 221538,
+        "no": 9,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12083497,
+            "name": "PO8",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645477564,
+        "name": "野火在燃烧",
+        "duration": 181678,
+        "no": 10,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645477538,
+        "name": "天使在歌唱",
+        "duration": 170769,
+        "no": 11,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 2645475932,
+        "name": "来临的信号",
+        "duration": 201538,
+        "no": 12,
+        "artists": [
+          {
+            "id": 12453904,
+            "name": "11李佳毅",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 253402661,
+          "name": "牧羊人"
+        },
+        "alias": [],
+        "transNames": [
+          "OUTRO"
+        ]
+      }
+    ]
+  },
+  {
+    "apple_album_id": 1581209252,
+    "source_album_id": 131732033,
+    "apple": [
+      {
+        "kind": "song",
+        "trackId": 1581209253,
+        "trackName": "Trash Rap",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 214344,
+        "collectionId": 1581209252,
+        "trackNumber": 1,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209556,
+        "trackName": "Sore",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 160248,
+        "collectionId": 1581209252,
+        "trackNumber": 2,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209558,
+        "trackName": "All the Suckers Die (feat. 99 God)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 207959,
+        "collectionId": 1581209252,
+        "trackNumber": 3,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209559,
+        "trackName": "Eheheh",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 235107,
+        "collectionId": 1581209252,
+        "trackNumber": 4,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209568,
+        "trackName": "Weiweiwei (feat. 连麻swimming)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 207072,
+        "collectionId": 1581209252,
+        "trackNumber": 5,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209577,
+        "trackName": "Airplane",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 144039,
+        "collectionId": 1581209252,
+        "trackNumber": 6,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209578,
+        "trackName": "I'd Like too",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 179459,
+        "collectionId": 1581209252,
+        "trackNumber": 7,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209677,
+        "trackName": "Beast Master (feat. Shooter)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 146577,
+        "collectionId": 1581209252,
+        "trackNumber": 8,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209679,
+        "trackName": "Fran",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 195288,
+        "collectionId": 1581209252,
+        "trackNumber": 9,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209683,
+        "trackName": "Perfunctoriness (feat. 周维觅)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 175765,
+        "collectionId": 1581209252,
+        "trackNumber": 10,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209686,
+        "trackName": "Last Time (feat. Oxy)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 248163,
+        "collectionId": 1581209252,
+        "trackNumber": 11,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209691,
+        "trackName": "Wipe That Mic",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 227993,
+        "collectionId": 1581209252,
+        "trackNumber": 12,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209696,
+        "trackName": "Homework",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 97488,
+        "collectionId": 1581209252,
+        "trackNumber": 13,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209699,
+        "trackName": "TSEB",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 203232,
+        "collectionId": 1581209252,
+        "trackNumber": 14,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209700,
+        "trackName": "Trash Talker (feat. Kandi)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 196424,
+        "collectionId": 1581209252,
+        "trackNumber": 15,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209701,
+        "trackName": "Cripple",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 195083,
+        "collectionId": 1581209252,
+        "trackNumber": 16,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209917,
+        "trackName": "Imaginary World (feat. 法老)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 232584,
+        "collectionId": 1581209252,
+        "trackNumber": 17,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209923,
+        "trackName": "Son of Luzhou",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 245702,
+        "collectionId": 1581209252,
+        "trackNumber": 18,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209928,
+        "trackName": "8 Cents (feat. 张小雨)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 249596,
+        "collectionId": 1581209252,
+        "trackNumber": 19,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209929,
+        "trackName": "I Dont Need You (feat. 张小雨)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 225114,
+        "collectionId": 1581209252,
+        "trackNumber": 20,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209930,
+        "trackName": "My Card For You (feat. BLOODZ BOI 血男孩)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 137207,
+        "collectionId": 1581209252,
+        "trackNumber": 21,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209935,
+        "trackName": "It's A Sad Song (feat. Oxy)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 262694,
+        "collectionId": 1581209252,
+        "trackNumber": 22,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581209938,
+        "trackName": "Preservation",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 133642,
+        "collectionId": 1581209252,
+        "trackNumber": 23,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210098,
+        "trackName": "Looking To The Future (feat. Oxy)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 191528,
+        "collectionId": 1581209252,
+        "trackNumber": 24,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210103,
+        "trackName": "Indigo Boy",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 179212,
+        "collectionId": 1581209252,
+        "trackNumber": 25,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210105,
+        "trackName": "Soul Searching (feat. 光光)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 259117,
+        "collectionId": 1581209252,
+        "trackNumber": 26,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210114,
+        "trackName": "What Can I Do",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 192000,
+        "collectionId": 1581209252,
+        "trackNumber": 27,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210121,
+        "trackName": "5618",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 121756,
+        "collectionId": 1581209252,
+        "trackNumber": 28,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210123,
+        "trackName": "Woof Woof",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 154512,
+        "collectionId": 1581209252,
+        "trackNumber": 29,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210937,
+        "trackName": "Scalpel (feat. 圣代)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 239952,
+        "collectionId": 1581209252,
+        "trackNumber": 30,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210947,
+        "trackName": "Closed World Assumption",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 252852,
+        "collectionId": 1581209252,
+        "trackNumber": 31,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210952,
+        "trackName": "2021 (feat. LSGCsikoriot)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 179296,
+        "collectionId": 1581209252,
+        "trackNumber": 32,
+        "discNumber": 1,
+        "trackCount": 33
+      },
+      {
+        "kind": "song",
+        "trackId": 1581210957,
+        "trackName": "Declaration Of AI World (feat. ASTP叁眼怪兽)",
+        "artistName": "Lil Andy",
+        "collectionName": "Closed World Assumption",
+        "trackTimeMillis": 185806,
+        "collectionId": 1581209252,
+        "trackNumber": 33,
+        "discNumber": 1,
+        "trackCount": 33
+      }
+    ],
+    "songs": [
+      {
+        "id": 1869161132,
+        "name": "垃圾说唱",
+        "duration": 214343,
+        "no": 1,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159136,
+        "name": "疮",
+        "duration": 160248,
+        "no": 2,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161122,
+        "name": "all the suckers DIE (feat.99God)",
+        "duration": 207958,
+        "no": 3,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 31511662,
+            "name": "99 God",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161147,
+        "name": "噎噎噎",
+        "duration": 235106,
+        "no": 4,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159161,
+        "name": "喂喂喂 (feat.连麻swimming)",
+        "duration": 207072,
+        "no": 5,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12064019,
+            "name": "连麻Swimming",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159127,
+        "name": "灰机",
+        "duration": 144039,
+        "no": 6,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161123,
+        "name": "我也想",
+        "duration": 179458,
+        "no": 7,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161105,
+        "name": "兽王 (feat.shooter)",
+        "duration": 146577,
+        "no": 8,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12292664,
+            "name": "Shooter",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161126,
+        "name": "弗兰",
+        "duration": 195287,
+        "no": 9,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869168605,
+        "name": "应付 (feat.周维觅)",
+        "duration": 175764,
+        "no": 10,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 33426563,
+            "name": "维觅WITHME",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869168248,
+        "name": "最后一次 (feat.许宏阳)",
+        "duration": 248163,
+        "no": 11,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12038187,
+            "name": "Oxy",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161134,
+        "name": "擦擦我的麦",
+        "duration": 227993,
+        "no": 12,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159111,
+        "name": "呆家里做作业",
+        "duration": 97488,
+        "no": 13,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161119,
+        "name": "TSEB",
+        "duration": 203232,
+        "no": 14,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161124,
+        "name": "口嗨怪 (feat.Kandi)",
+        "duration": 196423,
+        "no": 15,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 29265708,
+            "name": "侃迪kandi",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161121,
+        "name": "残废",
+        "duration": 195083,
+        "no": 16,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161136,
+        "name": "我会想象有一个世界 (feat.法老)",
+        "duration": 232583,
+        "no": 17,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 865007,
+            "name": "法老",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161160,
+        "name": "庐州之子",
+        "duration": 245702,
+        "no": 18,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161137,
+        "name": "八毛  (feat.张小雨)",
+        "duration": 249595,
+        "no": 19,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 34783610,
+            "name": "Ailee-张小雨",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161138,
+        "name": "不需要你 (feat.张小雨)",
+        "duration": 225114,
+        "no": 20,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 34783610,
+            "name": "Ailee-张小雨",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869169069,
+        "name": "这张卡是我留给你的 (feat.血男孩)",
+        "duration": 137206,
+        "no": 21,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 2103,
+            "name": "血男孩",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159181,
+        "name": "It‘s a sad song (feat.许宏阳)",
+        "duration": 262694,
+        "no": 22,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12038187,
+            "name": "Oxy",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159126,
+        "name": "保养",
+        "duration": 133641,
+        "no": 23,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159162,
+        "name": "展望未来 (feat.许宏阳)",
+        "duration": 191527,
+        "no": 24,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12038187,
+            "name": "Oxy",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159158,
+        "name": "孤独蓝孩",
+        "duration": 179212,
+        "no": 25,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161179,
+        "name": "找回我的精神 (feat.Mc光光)",
+        "duration": 259116,
+        "no": 26,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 187903,
+            "name": "Mc光光",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161125,
+        "name": "我能做什么",
+        "duration": 192000,
+        "no": 27,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161103,
+        "name": "五十六八",
+        "duration": 121756,
+        "no": 28,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869168242,
+        "name": "汪汪汪汪汪汪",
+        "duration": 154511,
+        "no": 29,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159170,
+        "name": "手术刀 (feat.圣代)",
+        "duration": 239952,
+        "no": 30,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 12564922,
+            "name": "圣代",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869161157,
+        "name": "封闭世界假定",
+        "duration": 252852,
+        "no": 31,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159156,
+        "name": "2021 (feat.LSGCsikoriot)",
+        "duration": 179296,
+        "no": 32,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 33097968,
+            "name": "LSGCsikoriot",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      },
+      {
+        "id": 1869159159,
+        "name": "对机器人军团的宣战书 (feat.叁眼怪兽)",
+        "duration": 185806,
+        "no": 33,
+        "artists": [
+          {
+            "id": 12099063,
+            "name": "小安迪LilAndyKillThemAll",
+            "alias": [],
+            "trans": ""
+          },
+          {
+            "id": 13039903,
+            "name": "ASTP叁眼怪獣",
+            "alias": [],
+            "trans": ""
+          }
+        ],
+        "album": {
+          "id": 131732033,
+          "name": "封闭世界假定"
+        },
+        "alias": [],
+        "transNames": null
+      }
+    ],
+    "initial_candidate": true
+  }
+]

@@ -181,6 +181,7 @@ class SettingsWindow(QWidget):
             QPushButton#windowButton:hover { background: rgba(255,255,255,20); }
             QPushButton#closeWindow:hover { background: #a84655; }
             QComboBox { padding-right: 22px; }
+            QComboBox#sourceChoice { padding-left: 6px; padding-right: 18px; }
             QComboBox::drop-down { border: none; width: 21px; }
             QComboBox::down-arrow { image: url("CHEVRON_PATH"); width: 12px; height: 12px; }
             QComboBox QAbstractItemView { background: #293950; color: #e7effa; border: 1px solid #65768e; selection-background-color: #405b7c; selection-color: white; padding: 5px; outline: none; }
