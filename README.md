@@ -1,40 +1,41 @@
-# MoonLyrics · 月光歌词
+# MoonLyrics
 
-为 Windows 版 Apple Music 提供桌面悬浮歌词，以凝润磨砂玻璃呈现流畅的歌词滚动。
+English · [简体中文](README.zh-CN.md)
 
-**[下载最新版](https://github.com/mooneverun/MoonLyrics/releases/latest)** · [v0.1.2 发布说明](https://github.com/mooneverun/MoonLyrics/releases/tag/v0.1.2) · [反馈问题](https://github.com/mooneverun/MoonLyrics/issues)
+Floating desktop lyrics for Apple Music on Windows, with a frosted glass background and smooth scrolling.
 
-## 功能
+**[Download](https://github.com/mooneverun/MoonLyrics/releases/latest)** · [Release notes](https://github.com/mooneverun/MoonLyrics/releases/tag/v0.1.2) · [Report an issue](https://github.com/mooneverun/MoonLyrics/issues)
 
-- 自动跟随 Apple Music 的当前歌曲和播放进度。
-- 酷狗、LRCLIB、网易云、QQ 音乐四源自动匹配，可调整优先顺序，无需额外登录。
-- 中文歌词统一显示简体，支持跨地区曲名与中英韩歌手别名匹配。
-- 歌词居中平滑滚动、上下渐隐，长句横向移动，支持字体切换和时间校准。
-- 解锁后悬停显示上一曲、播放/暂停、下一曲，控制区与歌词条共用玻璃效果。
-- 成功匹配的歌词自动保存到本地，重启后也可直接读取，支持一键清空。
-- 歌词条与设置面板透明度联动，背景框大小可调。
-- 支持拖动、锁定、鼠标穿透，以及收起到系统托盘。
-- 简体中文、繁體中文、English、日本語、한국어界面，六种快捷位置，刷新上限可设为 120 FPS。
+## Features
 
-## 使用
+- Follows the current song and playback position in Apple Music.
+- Matches lyrics from Kugou, LRCLIB, NetEase Cloud Music and QQ Music, with adjustable source priority and no extra login or API key.
+- Handles regional track names and Chinese, English and Korean artist aliases; displays Chinese lyrics in Simplified Chinese.
+- Smooth scrolling, faded context lines and horizontal scrolling for long lyrics. Includes font selection, bundled Noto Sans SC Black and timing adjustment.
+- Previous, play/pause and next controls appear on hover when unlocked, sharing the lyric bar's glass surface.
+- Saves matched lyrics locally for repeat playback, with a cache-clearing option.
+- Adjustable size and shared transparency for the lyric bar and settings panel.
+- Drag, lock, click-through, six position shortcuts and a system tray icon.
+- English, 简体中文, 繁體中文, 日本語 and 한국어 interfaces; refresh limit up to 120 FPS.
 
-1. 从 [Releases](https://github.com/mooneverun/MoonLyrics/releases/latest) 下载 Windows 版 `.exe`，直接运行，无需安装 Python。
-2. 打开 Windows 版 Apple Music 并播放歌曲，等待歌词自动匹配。
-3. 在设置中调整透明度、歌词源顺序或同步时间；点击“−”收起到托盘，点击托盘月光图标恢复。
+## Getting started
 
-运行要求：64 位 Windows 10（2004+）或 Windows 11，显卡支持 OpenGL 3.3。当前已在 Windows 11 验证，Windows 10 尚未实机测试，macOS 版暂未提供。
+1. Download the Windows `.exe` from [Releases](https://github.com/mooneverun/MoonLyrics/releases/latest) and run it. Python is not required.
+2. Open Apple Music for Windows and play a song. Lyrics are matched automatically.
+3. Adjust transparency, source priority or timing in Settings. Unlock the lyric bar to drag it or use playback controls. Click “−” to minimize to the tray; click the moon icon to restore Settings.
 
-## 说明
+Requires 64-bit Windows 10 (2004+) or Windows 11 and OpenGL 3.3 support. Tested on Windows 11; Windows 10 has not been tested on a physical device. A macOS version is not available yet. The FPS setting is an upper limit, not a guaranteed frame rate.
 
-- 首次歌词查询需要网络，缓存命中时无需重新查询；覆盖率和同步精度取决于第三方来源，不使用 Apple Music 的订阅歌词。
-- 桌面图像只在本机处理，不保存、不上传；歌词查询会发送歌曲元数据。
-- 设置和日志保存在 `%LOCALAPPDATA%\MoonLyrics\`。
-- 歌词缓存位于其 `cache\lyrics\` 子目录，自动清理过期和较早使用的内容。
+## Notes
+
+- Initial lyric searches require an internet connection; cached matches can be read locally. Coverage and timing depend on third-party sources. MoonLyrics does not use Apple Music's subscription lyrics.
+- Desktop images are processed locally and are never saved or uploaded. Lyric searches send song metadata to catalog and lyric services.
+- Settings and logs: `%LOCALAPPDATA%\MoonLyrics\`. Lyrics: its `cache\lyrics\` subfolder, with automatic expiry and cleanup.
 
 <details>
-<summary>从源码运行与打包</summary>
+<summary>Run from source or build an EXE</summary>
 
-需要 Python 3.12，在项目目录执行：
+With Python 3.12, run these commands in the project directory:
 
 ```powershell
 python -m venv .venv
@@ -43,10 +44,10 @@ python -m venv .venv
 .\build.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-打包结果：`dist\MoonLyrics.exe`。版本号见 [VERSION](VERSION)。
+Output: `dist\MoonLyrics.exe`. The application version is recorded in [VERSION](VERSION).
 
 </details>
 
-## 许可
+## License
 
-[GNU GPL v3.0](LICENSE)。
+[GNU GPL v3.0](LICENSE). The bundled font has its own [SIL Open Font License](assets/NotoSansSC-OFL.txt).
