@@ -1,13 +1,16 @@
 """Desktop capture failures must recover without overriding an explicit pause."""
 import ctypes as C
 import sys
+import threading
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 if sys.platform == "win32":
     from PyQt6.QtCore import QEvent, QTimer
     from PyQt6.QtWidgets import QApplication
     from moonlyrics import windows as native
+    from moonlyrics import windows_capture as capture
     from moonlyrics.playback import PlaybackSnapshot
     from moonlyrics.styles import DEFAULTS
 
@@ -107,32 +110,64 @@ class CaptureRecoveryTests(unittest.TestCase):
         self.assertEqual(self.control.error, "GPU failure")
         self.assertEqual(self.control.pause.text(), "重试刷新")
 
-    def test_capture_exclusion_failure_remains_fatal(self):
+    def test_capture_permission_failure_remains_fatal(self):
         with patch.object(native, "set_affinity", return_value=False):
             self.glass.protect()
         self.assertTrue(self.glass.paused)
         self.assertFalse(self.glass.timer.isActive())
-        self.assertIn("递归", self.control.error)
+        self.assertIn("可捕获", self.control.error)
 
-    def test_reset_failure_releases_partially_allocated_dc(self):
-        self.glass.capture.close()
-        with patch.object(native, "get_dc", return_value=123), \
-                patch.object(native, "compatible_dc", return_value=0), \
-                patch.object(native, "release_dc") as release:
-            with self.assertRaises(OSError):
-                self.glass.capture.reset()
-            release.assert_called_once_with(None, 123)
-        self.assertFalse(self.glass.capture.screen_dc)
-        self.assertFalse(self.glass.capture.memory_dc)
+    def test_initialization_failure_releases_the_partial_native_host(self):
+        worker = capture._Sampler()
+        with patch.object(capture, "mag_initialize", return_value=True), \
+                patch.object(capture, "create_window", side_effect=[123, 0]), \
+                patch.object(capture, "layer_alpha", return_value=True), \
+                patch.object(capture, "destroy_window") as destroy, \
+                patch.object(capture, "mag_uninitialize") as uninitialize:
+            worker.run()
+        self.assertIsNotNone(worker.error)
+        destroy.assert_called_once_with(123)
+        uninitialize.assert_called_once_with()
 
-    def test_reset_does_not_create_memory_dc_when_desktop_is_unavailable(self):
-        with patch.object(native, "get_dc", return_value=0), \
-                patch.object(native, "compatible_dc") as create:
-            with self.assertRaises(OSError):
-                self.glass.capture.reset()
-            create.assert_not_called()
-        self.assertFalse(self.glass.capture.screen_dc)
-        self.assertFalse(self.glass.capture.memory_dc)
+    def test_no_native_window_is_created_when_capture_runtime_is_unavailable(self):
+        worker = capture._Sampler()
+        with patch.object(capture, "mag_initialize", return_value=False), \
+                patch.object(capture, "create_window") as create, \
+                patch.object(capture, "mag_uninitialize") as uninitialize:
+            worker.run()
+        self.assertIsNotNone(worker.error)
+        create.assert_not_called()
+        uninitialize.assert_not_called()
+
+    def test_stalled_sampling_recovers_without_accumulating_replacement_threads(self):
+        sampler = capture.DesktopRegion()
+        worker = SimpleNamespace(lock=threading.Lock(), error=None, latest=None, start=Mock(),
+                                 wake=threading.Event(), stopping=threading.Event(), join=Mock(), is_alive=Mock(return_value=True))
+        def rectangle(hwnd, rect):
+            rect._obj.right, rect._obj.bottom = 320, 80
+            return True
+        with patch.object(capture, "_Sampler", return_value=worker) as factory, \
+                patch.object(capture, "client_rect", side_effect=rectangle), \
+                patch.object(capture, "client_origin", return_value=True), \
+                patch.object(capture, "metrics", side_effect=lambda n: {76: 0, 77: 0, 78: 1920, 79: 1080}[n]):
+            for stamp in (100, 100.8, 101.6, 102.4):
+                with patch.object(capture.time, "perf_counter", return_value=stamp):
+                    self.assertIsNone(sampler.capture(123, 0))
+            with patch.object(capture.time, "perf_counter", return_value=103.2):
+                with self.assertRaisesRegex(OSError, "未更新"):
+                    sampler.capture(123, 0)
+            # No polling during a manual pause must not count as a stalled sampler.
+            with patch.object(capture.time, "perf_counter", return_value=500):
+                self.assertIsNone(sampler.capture(123, 0))
+            for _ in range(3):
+                with self.assertRaises(OSError):
+                    sampler.reset()
+                self.assertIs(sampler.worker, worker)
+            factory.assert_called_once()
+            self.assertTrue(worker.stopping.is_set())
+            worker.is_alive.return_value = False
+            self.assertTrue(sampler.close())
+            self.assertIsNone(sampler.worker)
 
 
 if __name__ == "__main__":

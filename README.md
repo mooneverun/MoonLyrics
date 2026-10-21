@@ -2,14 +2,15 @@
 
 为 Windows 版 Apple Music 提供桌面悬浮歌词，以凝润磨砂玻璃呈现流畅的歌词滚动。
 
-**[下载最新版](https://github.com/mooneverun/MoonLyrics/releases/latest)** · [v0.1.1 发布说明](https://github.com/mooneverun/MoonLyrics/releases/tag/v0.1.1) · [反馈问题](https://github.com/mooneverun/MoonLyrics/issues)
+**[下载最新版](https://github.com/mooneverun/MoonLyrics/releases/latest)** · [v0.1.2 发布说明](https://github.com/mooneverun/MoonLyrics/releases/tag/v0.1.2) · [反馈问题](https://github.com/mooneverun/MoonLyrics/issues)
 
 ## 功能
 
 - 自动跟随 Apple Music 的当前歌曲和播放进度。
 - 酷狗、LRCLIB、网易云、QQ 音乐四源自动匹配，可调整优先顺序，无需额外登录。
 - 中文歌词统一显示简体，支持跨地区曲名与中英韩歌手别名匹配。
-- 歌词居中平滑滚动、上下渐隐，支持时间校准。
+- 歌词居中平滑滚动、上下渐隐，长句横向移动，支持字体切换和时间校准。
+- 解锁后悬停显示上一曲、播放/暂停、下一曲，控制区与歌词条共用玻璃效果。
 - 成功匹配的歌词自动保存到本地，重启后也可直接读取，支持一键清空。
 - 歌词条与设置面板透明度联动，背景框大小可调。
 - 支持拖动、锁定、鼠标穿透，以及收起到系统托盘。

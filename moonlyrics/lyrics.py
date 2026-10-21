@@ -263,7 +263,7 @@ class Lyrics:
         if index >= len(self.lines) - 1:
             return float(index)
         cue = self.lines[index + 1].time
-        span = min(.55, (cue - self.lines[index].time) * .6) if index >= 0 else .55
+        span = min(.65, (cue - self.lines[index].time) * .6) if index >= 0 else .65
         if span <= 0:
             return float(index)
         fraction = max(0., min(1., (position - cue + span) / span))

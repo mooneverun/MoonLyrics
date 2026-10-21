@@ -12,15 +12,15 @@ import struct
 import sys
 import time
 
-from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QSurfaceFormat, QVector2D, QVector4D
 from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLShader, QOpenGLShaderProgram,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGridLayout,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFontComboBox, QGraphicsOpacityEffect, QGridLayout,
                             QHBoxLayout, QLabel, QMenu, QMessageBox, QProgressBar, QPushButton,
-                            QSlider, QSystemTrayIcon, QVBoxLayout, QWidget)
+                            QSizePolicy, QSlider, QSystemTrayIcon, QToolButton, QToolTip, QVBoxLayout, QWidget)
 
 from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, FPS_OPTIONS, normalized, transparency_amount, lyric_offset_seconds
 from . import __version__
@@ -29,127 +29,24 @@ from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
 from .windows_media import AppleMusicReader, media_probe
 from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
 from .lyrics_worker import LyricsWorker
-from .lyric_paint import lyric_layer
-from .settings_ui import SettingsWindow, application_icon
+from .lyric_paint import load_bundled_font, lyric_font, lyric_layer, lyric_pan
+from .settings_ui import SettingsWindow, application_icon, media_icon
+from .windows_capture import DesktopRegion, api
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "MoonLyrics"
 LEGACY_DIR = APP_DIR.parent / "LyricFloatGlassSample"
 LOG = logging.getLogger("moonlyrics")
-user32, gdi32, kernel32, psapi = (C.WinDLL(n, use_last_error=True)
-                                    for n in ("user32", "gdi32", "kernel32", "psapi"))
+user32, kernel32, psapi = (C.WinDLL(n, use_last_error=True) for n in ("user32", "kernel32", "psapi"))
 
 
-def api(dll, name, result, *args):
-    fn = getattr(dll, name)
-    fn.restype, fn.argtypes = result, args
-    return fn
-
-
-get_dc = api(user32, "GetDC", W.HDC, W.HWND)
-release_dc = api(user32, "ReleaseDC", C.c_int, W.HWND, W.HDC)
-client_rect = api(user32, "GetClientRect", W.BOOL, W.HWND, C.POINTER(W.RECT))
-client_origin = api(user32, "ClientToScreen", W.BOOL, W.HWND, C.POINTER(W.POINT))
 set_affinity = api(user32, "SetWindowDisplayAffinity", W.BOOL, W.HWND, W.DWORD)
 get_affinity = api(user32, "GetWindowDisplayAffinity", W.BOOL, W.HWND, C.POINTER(W.DWORD))
 get_window_long = api(user32, "GetWindowLongPtrW", C.c_ssize_t, W.HWND, C.c_int)
+get_window = api(user32, "GetWindow", W.HWND, W.HWND, W.UINT)
+window_attribute = api(C.WinDLL("dwmapi"), "DwmGetWindowAttribute", C.c_long,
+                       W.HWND, W.DWORD, C.c_void_p, W.DWORD)
 set_window_pos = api(user32, "SetWindowPos", W.BOOL, W.HWND, W.HWND,
                      C.c_int, C.c_int, C.c_int, C.c_int, W.UINT)
-compatible_dc = api(gdi32, "CreateCompatibleDC", W.HDC, W.HDC)
-delete_dc = api(gdi32, "DeleteDC", W.BOOL, W.HDC)
-select_object = api(gdi32, "SelectObject", W.HANDLE, W.HDC, W.HANDLE)
-delete_object = api(gdi32, "DeleteObject", W.BOOL, W.HANDLE)
-bit_blt = api(gdi32, "BitBlt", W.BOOL, W.HDC, C.c_int, C.c_int, C.c_int, C.c_int,
-              W.HDC, C.c_int, C.c_int, W.DWORD)
-gdi_flush = api(gdi32, "GdiFlush", W.BOOL)
-metrics = api(user32, "GetSystemMetrics", C.c_int, C.c_int)
-
-
-class BitmapInfo(C.Structure):
-    _fields_ = [("size", W.DWORD), ("width", W.LONG), ("height", W.LONG),
-                ("planes", W.WORD), ("bit_count", W.WORD), ("compression", W.DWORD),
-                ("image_size", W.DWORD), ("x_ppm", W.LONG), ("y_ppm", W.LONG),
-                ("colors_used", W.DWORD), ("colors_important", W.DWORD),
-                ("color", W.DWORD)]
-
-
-dib_section = api(gdi32, "CreateDIBSection", W.HBITMAP, W.HDC, C.POINTER(BitmapInfo),
-                  W.UINT, C.POINTER(C.c_void_p), W.HANDLE, W.DWORD)
-
-
-class DesktopRegion:
-    """Keep one reusable native bitmap; capture only the glass area plus filter padding."""
-    def __init__(self):
-        self.screen_dc = self.memory_dc = None
-        self.bitmap = None
-        self.old_bitmap = None
-        self.bits = C.c_void_p()
-        self.size = (0, 0)
-        self.bounds = (0., 0., 1., 1.)
-        self.reset()
-
-    def reset(self):
-        self.close()
-        self.screen_dc = get_dc(None)
-        if not self.screen_dc:
-            raise C.WinError(C.get_last_error())
-        self.memory_dc = compatible_dc(self.screen_dc)
-        if not self.memory_dc:
-            error = C.get_last_error()
-            self.close()
-            raise C.WinError(error)
-
-    def capture(self, hwnd, pad):
-        rect, origin = W.RECT(), W.POINT(0, 0)
-        if not client_rect(hwnd, C.byref(rect)) or not client_origin(hwnd, C.byref(origin)):
-            raise C.WinError(C.get_last_error())
-        fw, fh = rect.right, rect.bottom
-        width, height = fw + 2 * pad, fh + 2 * pad
-        if min(fw, fh) < 1 or max(width, height) > 8192:
-            raise RuntimeError("无效的桌面取样尺寸")
-        if self.size != (width, height):
-            if self.bitmap:
-                select_object(self.memory_dc, self.old_bitmap)
-                delete_object(self.bitmap)
-                self.bitmap = None
-            info = BitmapInfo()
-            info.size, info.width, info.height = 40, width, height
-            info.planes, info.bit_count = 1, 32
-            self.bitmap = dib_section(self.screen_dc, C.byref(info), 0, C.byref(self.bits), None, 0)
-            if not self.bitmap:
-                raise C.WinError(C.get_last_error())
-            self.old_bitmap = select_object(self.memory_dc, self.bitmap)
-            self.size = width, height
-        x, y = origin.x - pad, origin.y - pad
-        vx, vy, vw, vh = (metrics(n) for n in (76, 77, 78, 79))
-        sx, sy = max(x, vx), max(y, vy)
-        right, bottom = min(x + width, vx + vw), min(y + height, vy + vh)
-        if right <= sx or bottom <= sy:
-            raise RuntimeError("玻璃条位于显示器范围外")
-        if not bit_blt(self.memory_dc, sx - x, sy - y, right - sx, bottom - sy,
-                       self.screen_dc, sx, sy, 0x00CC0020 | 0x40000000):
-            raise C.WinError(C.get_last_error())
-        gdi_flush()
-        # UV coordinates are bottom-up, matching native DIB rows and OpenGL textures.
-        self.bounds = ((sx - x + .5) / width, (height - (bottom - y) + .5) / height,
-                       (right - x - .5) / width, (height - (sy - y) - .5) / height)
-        return fw, fh, pad
-
-    def close(self):
-        if self.bitmap:
-            select_object(self.memory_dc, self.old_bitmap)
-            delete_object(self.bitmap)
-            self.bitmap = None
-        if self.memory_dc:
-            delete_dc(self.memory_dc)
-            self.memory_dc = None
-        if self.screen_dc:
-            release_dc(None, self.screen_dc)
-            self.screen_dc = None
-        self.old_bitmap = None
-        self.bits = C.c_void_p()
-        self.size = (0, 0)
-
-
 class MemoryCounters(C.Structure):
     _fields_ = [("cb", W.DWORD), ("page_faults", W.DWORD)] + [
         (key, C.c_size_t) for key in ("peak_working_set", "working_set", "peak_paged",
@@ -234,8 +131,8 @@ void main() {
     color=mix(color,vec3(0.10,0.16,0.22),1.0-uTransparency);
     vec2 light=normalize(uLight+vec2(0.001));
     float rim=1.0-smoothstep(0.3*uDpr,1.5*uDpr,depth);
-    float facing=0.45+0.55*max(0.0,dot(normal,light));
-    color+=vec3(0.81,0.91,1.0)*(rim*facing*0.50+exp(-depth/(5.0*uDpr))*0.055);
+    float facing=0.12+0.88*max(0.0,dot(normal,light));
+    color+=vec3(0.81,0.91,1.0)*(rim*facing*0.25+exp(-depth/(4.0*uDpr))*0.025);
     float visible=1.0-smoothstep(0.90,1.0,uTransparency);
     float alpha=(1.0-smoothstep(-0.7,0.7,sdf))*visible;
     outputColor=vec4(color*alpha,alpha);
@@ -245,6 +142,7 @@ void main() {
 
 class GlassView(QOpenGLWidget):
     failed = pyqtSignal(str)
+    tone_changed = pyqtSignal()
 
     def __init__(self, settings, capture, parent):
         super().__init__(parent)
@@ -265,6 +163,10 @@ class GlassView(QOpenGLWidget):
         self.secondary_text = "播放音乐后显示歌曲与进度"
         self.lyrics = None
         self.scroll_position = -1.
+        self.pan_position = (-1, 0.)
+        self.lyric_time = 0.
+        self.lyric_end_time = None
+        self.control_space = 0
         self.lyric_index = -1
         self.lyric_image_key = None
         self.dark_text = False
@@ -293,20 +195,30 @@ class GlassView(QOpenGLWidget):
     def swapped(self):
         self.frames += 1
 
+    def lyric_width(self):
+        return max(1, self.width() - self.control_space)
+
     def set_lyrics(self, document, position=0.):
         self.lyrics = document
+        self.lyric_time = position
+        self.lyric_end_time = None
         self.lyric_index = document.index_at(position) if document else -1
         self.scroll_position = document.scroll_at(position) if document else -1.
+        self.pan_position = lyric_pan(document, position, self.lyric_width(), self.settings["lyric_font"])
         self.lyric_image_key = None
         self.update()
 
-    def set_lyric_time(self, position):
+    def set_lyric_time(self, position, end_time=None):
         if self.lyrics is None:
             return
         self.lyric_index = self.lyrics.index_at(position)
+        self.lyric_time = position
+        self.lyric_end_time = end_time
         scroll = self.lyrics.scroll_at(position)
-        if abs(scroll - self.scroll_position) > 1e-7:
-            self.scroll_position = scroll; self.update()
+        pan = lyric_pan(self.lyrics, position, self.lyric_width(), self.settings["lyric_font"], end_time)
+        if abs(scroll - self.scroll_position) > 1e-7 or pan != self.pan_position:
+            self.scroll_position, self.pan_position = scroll, pan
+            self.update()
 
     def initializeGL(self):
         try:
@@ -368,7 +280,10 @@ class GlassView(QOpenGLWidget):
         started = time.perf_counter()
         dpr = self.devicePixelRatioF()
         pad = math.ceil((self.settings["blur"] * .72 + self.settings["refraction"] * .32 + 4) * dpr)
-        self.frame_geometry = self.capture.capture(int(self.window().winId()), pad)
+        geometry = self.capture.capture(int(self.window().winId()), pad)
+        if geometry is None:
+            return False
+        self.frame_geometry = geometry
         fw, fh, _ = self.frame_geometry
         cw, ch = self.capture.size
         luminance = 0.
@@ -378,11 +293,14 @@ class GlassView(QOpenGLWidget):
             luminance += .2126 * pixel[2] + .7152 * pixel[1] + .0722 * pixel[0]
         amount = transparency_amount(self.settings["transparency_level"])
         luminance = luminance / 12 * amount + 38 * (1 - amount)
+        previous_tone = self.dark_text
         if luminance > 165: self.dark_text = True
         elif luminance < 135: self.dark_text = False
-        self.capture_ms = (time.perf_counter() - started) * 1000
+        if previous_tone != self.dark_text: self.tone_changed.emit()
+        self.capture_ms = self.capture.capture_ms + (time.perf_counter() - started) * 1000
         self.new_frame = True
         self.update()
+        return True
 
     def draw(self, program, source, width, height):
         self.gl.glViewport(0, 0, width, height)
@@ -464,29 +382,33 @@ class GlassView(QOpenGLWidget):
         if measure:
             self.query.end(); self.gpu_pending = True
         if self.show_text and self.lyrics is not None:
-            key = (id(self.lyrics), self.scroll_position, self.width(), self.height(), self.devicePixelRatioF(), self.dark_text)
+            family = self.settings["lyric_font"]
+            width = self.lyric_width()
+            pan = lyric_pan(self.lyrics, self.lyric_time, width, family, self.lyric_end_time)
+            key = (id(self.lyrics), self.scroll_position, pan, width, self.height(), self.devicePixelRatioF(), self.dark_text, family)
             if key != self.lyric_image_key:
-                self.lyric_image = lyric_layer(self.lyrics, self.scroll_position, self.width(), self.height(),
-                                               self.devicePixelRatioF(), self.dark_text)
+                self.lyric_image = lyric_layer(self.lyrics, self.scroll_position, width, self.height(),
+                                               self.devicePixelRatioF(), self.dark_text, family, pan)
                 self.lyric_image_key = key
             painter = QPainter(self); painter.drawImage(0, 0, self.lyric_image); painter.end()
         elif self.show_text:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-            font = QFont("Microsoft YaHei UI", 20)
-            font.setWeight(QFont.Weight.Medium); painter.setFont(font)
-            center = QRectF(16, self.height() / 2 - 28, self.width() - 32, 36)
+            font = lyric_font(self.settings["lyric_font"])
+            painter.setFont(font)
+            width = self.lyric_width()
+            center = QRectF(16, self.height() / 2 - 28, width - 32, 36)
             title = painter.fontMetrics().elidedText(self.primary_text, Qt.TextElideMode.ElideRight,
-                                                     max(1, self.width() - 32))
-            painter.setPen(QColor(255, 255, 255, 100) if self.dark_text else QColor(0, 0, 0, 150))
+                                                     max(1, width - 32))
+            painter.setPen(QColor(255, 255, 255, 36) if self.dark_text else QColor(0, 0, 0, 42))
             painter.drawText(center.translated(0, 1), Qt.AlignmentFlag.AlignCenter, title)
             painter.setPen(QColor(24, 38, 50) if self.dark_text else QColor(250, 253, 255))
             painter.drawText(center, Qt.AlignmentFlag.AlignCenter, title)
-            painter.setFont(QFont("Microsoft YaHei UI", 10))
+            font.setPixelSize(13); painter.setFont(font)
             subtitle = painter.fontMetrics().elidedText(self.secondary_text, Qt.TextElideMode.ElideRight,
-                                                        max(1, self.width() - 32))
+                                                        max(1, width - 32))
             painter.setPen(QColor(24, 38, 50, 200) if self.dark_text else QColor(250, 253, 255, 220))
-            painter.drawText(QRectF(16, self.height() / 2 + 9, self.width() - 32, 23),
+            painter.drawText(QRectF(16, self.height() / 2 + 9, width - 32, 23),
                              Qt.AlignmentFlag.AlignCenter, subtitle)
             painter.end()
 
@@ -506,12 +428,13 @@ class GlassView(QOpenGLWidget):
 class GlassWindow(QWidget):
     failed = pyqtSignal(str)
     capture_status_changed = pyqtSignal(bool)
+    media_command = pyqtSignal(str)
 
     def __init__(self, settings):
         super().__init__()
         self.settings = settings
         self.setWindowTitle("MoonLyrics · 月光歌词")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool |
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window |
                             Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -524,9 +447,81 @@ class GlassWindow(QWidget):
         self.timer.timeout.connect(self.refresh)
         self.paused = False
         self.retry_delay = 0
+        self.capture_needs_reset = False
         self.drag_anchor = None
+        self.locked = False
+        self.transport = QWidget(self)
+        self.transport.setObjectName("lyricTransport")
+        self.transport.setFixedWidth(136)
+        self.transport.setCursor(Qt.CursorShape.ArrowCursor)
+        self.transport.setStyleSheet("""
+            QWidget#lyricTransport { background: transparent; border: none; }
+            QToolButton { background: transparent; border: none; border-radius: 10px; }
+            QToolButton:hover { background: rgba(220,237,255,35); }
+            QToolButton:pressed { background: rgba(220,237,255,60); }
+        """)
+        # The full-frame renderer supplies the only glass surface and outer corner clip.
+        self.transport_divider = QWidget(self.transport)
+        self.transport_divider.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.transport_divider.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 rgba(240,248,255,0), stop:0.5 rgba(240,248,255,60), stop:1 rgba(240,248,255,0));")
+        buttons = QHBoxLayout(self.transport); buttons.setContentsMargins(10, 0, 10, 0); buttons.setSpacing(4)
+        self.media_dark = False
+        self.media_icons = {name: media_icon(name) for name in ("previous", "play", "pause", "next")}
+        self.media_buttons = {}
+        for action in ("previous", "toggle", "next"):
+            button = QToolButton(self.transport)
+            button.setIcon(self.media_icons["play" if action == "toggle" else action])
+            button.setIconSize(QSize(20, 20)); button.setFixedSize(36, 36)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, name=action: self.media_command.emit(name))
+            self.media_buttons[action] = button
+            buttons.addWidget(button)
+        self.transport_effect = QGraphicsOpacityEffect(self.transport)
+        self.transport_effect.setOpacity(0.)
+        self.transport.setGraphicsEffect(self.transport_effect)
+        self.transport.hide()
+        self.transport_animation = QVariantAnimation(self)
+        self.transport_animation.setDuration(180)
+        self.transport_animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self.transport_animation.valueChanged.connect(self.animate_transport)
+        self.transport_animation.finished.connect(self.transport_finished)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.resize(settings["width"], settings["height"])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "transport"):
+            self.transport.setGeometry(self.width() - self.transport.width(), 0, self.transport.width(), self.height())
+            self.transport_divider.setGeometry(0, (self.height() - 44) // 2, 1, 44)
+
+    def animate_transport(self, value):
+        self.transport_effect.setOpacity(float(value))
+        self.view.control_space = round(self.transport.width() * float(value))
+        self.view.update()
+
+    def transport_finished(self):
+        if self.transport_effect.opacity() == 0:
+            self.transport.hide()
+
+    def reveal_transport(self, visible):
+        visible = visible and not self.locked and self.drag_anchor is None
+        self.transport_animation.stop()
+        self.transport.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not visible)
+        if visible:
+            self.transport.show(); self.transport.raise_()
+        self.transport_animation.setStartValue(self.transport_effect.opacity())
+        self.transport_animation.setEndValue(1. if visible else 0.)
+        self.transport_animation.start()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.reveal_transport(True)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.reveal_transport(False)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -535,39 +530,61 @@ class GlassWindow(QWidget):
     def protect(self):
         value = W.DWORD()
         hwnd = int(self.winId())
-        if (not set_affinity(hwnd, 0x11) or not get_affinity(hwnd, C.byref(value))
-                or value.value != 0x11):
-            self.fail("当前系统无法将玻璃条排除在桌面取样之外，已停止刷新以避免画面递归。")
+        if (not set_affinity(hwnd, 0) or not get_affinity(hwnd, C.byref(value))
+                or value.value != 0):
+            self.fail("无法启用可捕获的歌词窗口，请重新打开 MoonLyrics。")
             return
         self.ensure_topmost(force=True)
         if not self.paused:
             self.timer.start(self.retry_delay or round(1000 / self.settings["fps"]))
-        LOG.info("Desktop capture exclusion active; HWND=%s", hwnd)
+        LOG.info("Lyric window is capturable; backdrop uses a local exclusion filter; HWND=%s", hwnd)
 
     def ensure_topmost(self, *, force=False):
         if not self.isVisible() or self.isMinimized():
             return False
         hwnd = int(self.winId())
         was_topmost = bool(get_window_long(hwnd, -20) & 0x8)
+        ordinary_above = None
         if was_topmost and not force:
-            return True
+            # A surviving TOPMOST flag can disagree with the actual native Z-order.
+            above = get_window(hwnd, 3)  # GW_HWNDPREV
+            seen = set()
+            for _ in range(1024):
+                if not above or above in seen:
+                    break
+                seen.add(above)
+                style = get_window_long(above, -16)
+                if (style & 0x30000000 == 0x10000000  # visible, not minimized
+                        and not get_window_long(above, -20) & 0x8):
+                    cloaked = W.DWORD()
+                    if window_attribute(above, 14, C.byref(cloaked), C.sizeof(cloaked)) >= 0 and not cloaked.value:
+                        ordinary_above = above
+                        break
+                above = get_window(above, 3)
+            if ordinary_above is None:
+                return True
         # Reassert native Z-order without recreating the window or taking keyboard focus.
         flags = 0x0001 | 0x0002 | 0x0010 | 0x0200  # NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
         if not set_window_pos(hwnd, -1, 0, 0, 0, 0, flags):
             LOG.warning("Could not restore lyric topmost; HWND=%s error=%s", hwnd, C.get_last_error())
             return False
-        LOG.info("Restored lyric topmost; HWND=%s previous_topmost=%s force=%s", hwnd, was_topmost, force)
+        LOG.info("Restored lyric topmost; HWND=%s previous_topmost=%s force=%s ordinary_above=%s",
+                 hwnd, was_topmost, force, ordinary_above)
         return True
 
     def refresh(self):
         if self.paused or self.isMinimized() or not self.isVisible():
             return
         try:
-            if self.retry_delay:
+            if self.capture_needs_reset:
                 self.capture.reset()
-            self.view.take_frame()
+                self.capture_needs_reset = False
+                self.timer.start(round(1000 / self.settings["fps"]))
+            if self.view.take_frame() is False:
+                return
         except OSError:
             self.view.new_frame = False
+            self.capture_needs_reset = True
             if not self.retry_delay:
                 LOG.exception("Desktop capture unavailable; scheduling automatic recovery")
                 self.capture_status_changed.emit(True)
@@ -591,14 +608,23 @@ class GlassWindow(QWidget):
 
     def set_locked(self, locked):
         self.timer.stop(); self.drag_anchor = None
+        self.locked = locked
+        if locked:
+            self.transport_animation.stop(); self.animate_transport(0.)
+            self.transport.hide()
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, locked)
         self.show()
+        self.reveal_transport(not locked and self.underMouse())
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if self.transport.isVisible() and self.transport.geometry().contains(event.position().toPoint()):
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and not self.locked:
             self.drag_anchor = event.globalPosition().toPoint()
             self.drag_start = self.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.reveal_transport(False)
 
     def mouseMoveEvent(self, event):
         point = event.position()
@@ -614,8 +640,10 @@ class GlassWindow(QWidget):
     def mouseReleaseEvent(self, event):
         self.drag_anchor = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.reveal_transport(self.underMouse())
 
     def closeEvent(self, event):
+        self.transport_animation.stop()
         self.timer.stop(); self.view.shutdown(); self.capture.close()
         super().closeEvent(event)
 
@@ -628,6 +656,9 @@ class Controls(SettingsWindow):
         self.glass = GlassWindow(settings)
         self.glass.failed.connect(self.failed)
         self.glass.capture_status_changed.connect(self.capture_status_changed)
+        self.glass.media_command.connect(self.send_media_command)
+        self.glass.view.tone_changed.connect(self.render_media_controls)
+        self.media_command_busy = False
         self.error = None
         self.usage = Usage()
         self.samples = []
@@ -735,6 +766,20 @@ class Controls(SettingsWindow):
         description = QLabel(PRESETS["rich"]["description"])
         description.setObjectName("secondary")
         description.setWordWrap(True); layout.addWidget(description)
+        font_row = QHBoxLayout()
+        font_label = QLabel("歌词字体")
+        self.font_choice = QFontComboBox()
+        self.font_choice.setFontFilters(QFontComboBox.FontFilter.ScalableFonts)
+        self.font_choice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.font_choice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.font_choice.setMinimumContentsLength(14)
+        self.font_choice.setAccessibleName("歌词字体")
+        self.font_choice.setToolTip("使用本机已安装的字体，选择后立即应用；缺字时自动使用系统备用字体。")
+        self.font_choice.setCurrentFont(QFont(settings["lyric_font"]))
+        self.font_choice.currentFontChanged.connect(self.font_changed)
+        font_label.setBuddy(self.font_choice)
+        font_row.addWidget(font_label); font_row.addWidget(self.font_choice, 1)
+        layout.addLayout(font_row)
         grid = QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(14)
         labels = dict(transparency_level="背景透明度", width="玻璃条宽度", height="玻璃条高度")
         for row, (key, label) in enumerate(labels.items()):
@@ -819,6 +864,7 @@ class Controls(SettingsWindow):
             self.lyrics_worker.start()
             self.media_reader = AppleMusicReader(self)
             self.media_reader.snapshot_changed.connect(self.set_playback)
+            self.media_reader.command_finished.connect(self.media_command_finished)
             self.media_reader.start()
 
     def ui_text(self, source, **values):
@@ -842,6 +888,11 @@ class Controls(SettingsWindow):
     def language_changed(self):
         self.settings["language"] = self.language.currentData()
         self.retranslate_ui()
+
+    def font_changed(self, font):
+        self.settings["lyric_font"] = font.family()
+        self.glass.view.lyric_image_key = None
+        self.glass.view.update()
 
     def retranslate_ui(self):
         for setter, source in self.text_bindings:
@@ -869,6 +920,40 @@ class Controls(SettingsWindow):
         self.update_track_labels()
         self.update_playback_display()
         self.render_stats()
+        self.render_media_controls()
+
+    def render_media_controls(self):
+        if self.glass.media_dark != self.glass.view.dark_text:
+            self.glass.media_dark = self.glass.view.dark_text
+            self.glass.media_icons = {name: media_icon(name, self.glass.media_dark)
+                                      for name in ("previous", "play", "pause", "next")}
+        playing = self.playback.status == "playing"
+        for action, button in self.glass.media_buttons.items():
+            label = {"previous": "上一曲", "toggle": "暂停" if playing else "播放", "next": "下一曲"}[action]
+            button.setAccessibleName(self.ui_text(label)); button.setToolTip(self.ui_text(label))
+            button.setEnabled(bool(self.media_reader) and not self.closing and not self.media_command_busy
+                              and action in self.playback.controls)
+            button.setIcon(self.glass.media_icons[("pause" if playing else "play") if action == "toggle" else action])
+
+    def send_media_command(self, action):
+        if self.closing or self.media_command_busy or action not in self.playback.controls:
+            return
+        if self.media_reader and self.media_reader.request_command(action):
+            self.media_command_busy = True
+            self.render_media_controls()
+        else:
+            self.media_command_finished(action, "播放控制暂不可用，请稍后重试")
+
+    def media_command_finished(self, action, message):
+        if self.closing:
+            return
+        self.media_command_busy = False
+        self.runtime_message = message or "播放控制已发送"
+        self.render_runtime_status()
+        self.render_media_controls()
+        if message and self.glass.isVisible():
+            QToolTip.showText(self.glass.mapToGlobal(QPoint(self.glass.width() // 2, self.glass.height() + 8)),
+                              self.ui_text(message), self.glass)
 
     def update_track_labels(self):
         self.track_title.setText(self.playback.title or self.ui_text("等待 Apple Music"))
@@ -941,6 +1026,7 @@ class Controls(SettingsWindow):
             if self.glass.retry_delay:
                 self.glass.refresh()
         self.playback = snapshot
+        self.render_media_controls()
         self.lyric_clock.update(snapshot)
         self.update_track_labels()
         self.media_status.setToolTip(snapshot.message)
@@ -1020,7 +1106,9 @@ class Controls(SettingsWindow):
         timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
         self.media_status.setText(state); self.media_time.setText(timing)
         self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
-        self.glass.view.set_lyric_time(self.lyric_clock.position_at() + lyric_offset_seconds(self.settings))
+        offset = lyric_offset_seconds(self.settings)
+        self.glass.view.set_lyric_time(self.lyric_clock.position_at() + offset,
+                                      snapshot.duration + offset if snapshot.duration > 0 else None)
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
         secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else self.ui_text("播放音乐后显示歌曲与进度")
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
@@ -1081,6 +1169,7 @@ class Controls(SettingsWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        self.render_media_controls()
         self.lyric_debounce.stop()
         readers = [reader for reader in (self.media_reader, self.lyrics_worker) if reader is not None]
         for reader in readers:
@@ -1104,10 +1193,12 @@ class Controls(SettingsWindow):
 
 
 def self_test(app, control, report_path, preview_path):
-    from unittest.mock import patch
+    from dataclasses import replace
+    from unittest.mock import Mock, patch
     from PyQt6.QtTest import QTest
-    from PyQt6.QtGui import QImage
-    from PIL import Image, ImageChops, ImageFilter, ImageStat
+    from PyQt6.QtGui import QFontDatabase, QFontInfo, QImage
+    from PIL import Image, ImageChops, ImageFilter, ImageGrab, ImageStat
+    from .windows_capture import client_origin
 
     class Calibration(QWidget):
         pattern = "checker"
@@ -1133,6 +1224,12 @@ def self_test(app, control, report_path, preview_path):
         q = control.glass.view.grabFramebuffer().convertToFormat(QImage.Format.Format_RGBA8888)
         return Image.frombytes("RGBA", (q.width(), q.height()), q.bits().asstring(q.sizeInBytes())).convert("RGB")
 
+    def sampled_frame(pad):
+        deadline = time.perf_counter() + 3
+        while glass.capture.capture(int(glass.winId()), pad) is None:
+            assert time.perf_counter() < deadline, "Timed out waiting for a fresh background frame"
+            QTest.qWait(10)
+
     def parameters(**values):
         for key, number in values.items():
             if key == "fps": control.fps.setCurrentIndex(control.fps.findData(number))
@@ -1155,6 +1252,13 @@ def self_test(app, control, report_path, preview_path):
     glass.move(calibration.x() + 110, calibration.y() + 150)
     glass.show(); QTest.qWait(700)
     try:
+        font_id = load_bundled_font()
+        assert font_id >= 0, "The packaged default font is missing or invalid"
+        QFontDatabase.removeApplicationFont(font_id)
+        default_font = QFontInfo(lyric_font(None))
+        assert default_font.family() == "Noto Sans SC Black" and default_font.weight() == QFont.Weight.Black
+        assert "SIL OPEN FONT LICENSE" in (Path(__file__).resolve().parents[1] / "assets" / "NotoSansSC-OFL.txt").read_text(encoding="utf-8")
+        result["bundled_default_font"] = dict(family=default_font.family(), weight=default_font.weight(), license_included=True)
         assert control.sliders["transparency_level"].minimum() == 1
         assert control.sliders["transparency_level"].maximum() == 10
         assert "blur" not in control.sliders and "refraction" not in control.sliders
@@ -1176,29 +1280,37 @@ def self_test(app, control, report_path, preview_path):
         parameters(blur=15, refraction=24, transparency_level=1)
         glass.timer.stop(); glass.hide(); QTest.qWait(120)
         geometry = glass.view.frame_geometry
-        glass.capture.capture(int(glass.winId()), geometry[2])
+        sampled_frame(geometry[2])
         baseline = C.string_at(glass.capture.bits, math.prod(glass.capture.size) * 4)
         raw_image = Image.frombytes("RGB", glass.capture.size, baseline, "raw", "BGRX", 0, -1)
         colors = sorted(raw_image.getcolors(raw_image.width * raw_image.height), reverse=True)
         result["calibration_dominant_colors"] = colors[:2]
         assert all(color in [(41, 126, 187), (242, 192, 112)] for _, color in colors[:2]), "Calibration window is obscured"
         glass.show(); QTest.qWait(200); glass.timer.stop()
-        glass.capture.capture(int(glass.winId()), geometry[2])
+        sampled_frame(geometry[2])
         after = C.string_at(glass.capture.bits, len(baseline))
         difference = sum(abs(a - b) for a, b in zip(baseline, after)) / len(baseline)
         assert difference < .05, f"Capture includes overlay or changing background: {difference}"
         result["capture_exclusion_mean_byte_difference"] = difference
+        origin = W.POINT()
+        assert client_origin(int(glass.winId()), C.byref(origin))
+        fw, fh, pad = geometry
+        visible = ImageGrab.grab(bbox=(origin.x, origin.y, origin.x + fw, origin.y + fh), all_screens=True)
+        clean_background = raw_image.crop((pad, pad, pad + fw, pad + fh))
+        visible_difference = sum(ImageStat.Stat(ImageChops.difference(visible.convert("RGB"), clean_background)).mean) / 3
+        assert visible_difference > 5, "The lyric window is still excluded from ordinary screenshots"
+        assert not get_window_long(int(glass.winId()), -20) & 0x80, "The lyric window is a tool window"
+        owner = api(user32, "GetWindow", W.HWND, W.HWND, W.UINT)(int(glass.winId()), 4)
+        assert not owner, "The lyric window is owned by another window"
+        result["capture_compatibility"] = dict(ordinary_screenshot_visible=True, private_sampling_excludes_overlay=True,
+                                               normal_unowned_window=True, screenshot_mean_difference=visible_difference)
         frame_count = glass.view.frames
 
-        def denied(*args):
-            C.set_last_error(5)
-            return False
-
-        with patch("moonlyrics.windows.bit_blt", side_effect=denied):
+        with patch.object(glass.view, "take_frame", side_effect=C.WinError(5)):
             glass.refresh()
         assert glass.retry_delay == 1000 and glass.timer.isActive() and not glass.paused
-        # Also exercise repainting the retained GPU texture while rebuilding the desktop DC fails.
-        with patch("moonlyrics.windows.get_dc", return_value=0):
+        # Repaint the retained GPU texture while the background sampler cannot initialize.
+        with patch("moonlyrics.windows_capture.mag_initialize", return_value=False):
             QTest.qWait(1200)
             assert glass.retry_delay == 2000 and glass.capture.size == (0, 0)
             image()
@@ -1213,7 +1325,7 @@ def self_test(app, control, report_path, preview_path):
         fresh = C.string_at(glass.capture.bits, len(baseline))
         assert sum(abs(a - b) for a, b in zip(baseline, fresh)) / len(baseline) > 5, "Recovered capture still contains the old background"
         affinity = W.DWORD()
-        assert get_affinity(int(glass.winId()), C.byref(affinity)) and affinity.value == 0x11
+        assert get_affinity(int(glass.winId()), C.byref(affinity)) and affinity.value == 0
         result["capture_recovery"] = dict(access_denied=True, automatic_retry=True, native_resources_rebuilt=True,
                                             retained_texture=True, fresh_background=True, exclusion_preserved=True)
         glass.timer.stop()
@@ -1330,7 +1442,7 @@ def self_test(app, control, report_path, preview_path):
         assert glass.view.lyrics is None, "An old song replaced the current lyrics"
         control.accept_lyrics(8, document, "已匹配 · LRCLIB · 4 行")
         assert glass.view.lyric_index == 1
-        glass.view.set_lyric_time(67.725)
+        glass.view.set_lyric_time(67.675)
         assert abs(glass.view.scroll_position - 1.5) < 1e-7, "Lyric movement did not ease in before the cue"
         glass.view.set_lyric_time(68.)
         assert glass.view.scroll_position == 2.
@@ -1377,6 +1489,29 @@ def self_test(app, control, report_path, preview_path):
         result["lyrics_viewport"] = dict(clipped=True, edge_fade=True, center_emphasis=True,
                                          animated_scroll=True, seek_and_pause=True, stale_result_rejected=True,
                                          jitter_no_rewind=True, arrives_on_cue=True, timing_calibration=True)
+        original_font = control.settings["lyric_font"]
+        font_document = Lyrics((LyricLine(60., "Previous line"), LyricLine(64., "Moonlight · 月光"),
+                                LyricLine(74., "Next line")))
+        glass.view.set_lyrics(font_document, 64.1); QTest.qWait(50)
+        before_font = image()
+        font_index = control.font_choice.findText("Consolas")
+        assert font_index >= 0, "System font selector did not load the installed fonts"
+        control.font_choice.setCurrentIndex(font_index); QTest.qWait(50)
+        assert control.settings["lyric_font"] == "Consolas"
+        assert sum(ImageStat.Stat(ImageChops.difference(before_font, image())).mean) > .2
+        assert normalized(json.loads(json.dumps(control.settings)))["lyric_font"] == "Consolas"
+        long_document = Lyrics((LyricLine(64., "Moonlight through the window · 月光落在窗台 · " * 3),
+                                LyricLine(74., "Next line")))
+        glass.view.set_lyrics(long_document, 64.1); QTest.qWait(50)
+        before_pan = image()
+        glass.view.set_lyric_time(73.25); QTest.qWait(50)
+        assert glass.view.pan_position == (0, 1.) and glass.view.scroll_position == 0., (glass.view.pan_position, glass.view.scroll_position)
+        assert sum(ImageStat.Stat(ImageChops.difference(before_pan, image())).mean) > .2
+        glass.view.set_lyric_time(64.); assert glass.view.pan_position == (0, 0.)
+        control.font_choice.setCurrentFont(QFont(original_font))
+        glass.view.set_lyrics(document, 64.1)
+        result["lyric_typography"] = dict(live_font_switch=True, font_saved=True, fixed_font_size=True,
+                                          long_line_pan=True, seek_resets_pan=True)
         # Desktop sampling was verified above; keep it out of settings animation timing checks.
         glass.timer.stop()
         from .settings_ui import MATERIALS
@@ -1459,6 +1594,43 @@ def self_test(app, control, report_path, preview_path):
         glass.move(location)
         result["settings_controls"] = dict(languages=list(LANGUAGES), width_step_px=10, max_fps=120,
                                            calibration_standard=True, quick_positions=6, version=__version__)
+        original_reader, original_playback = control.media_reader, control.playback
+        fake_reader = Mock(request_command=Mock(return_value=True))
+        try:
+            control.media_reader = fake_reader
+            control.set_playback(replace(original_playback, controls=("previous", "toggle", "next")))
+            sampled_frame(glass.view.frame_geometry[2])
+            background = C.string_at(glass.capture.bits, math.prod(glass.capture.size) * 4)
+            glass.reveal_transport(True); QTest.qWait(230)
+            assert glass.transport.isVisible() and glass.view.control_space == glass.transport.width()
+            assert glass.view.lyric_width() == glass.transport.x()
+            assert glass.transport.geometry().right() == glass.rect().right()
+            assert glass.transport.y() == 0 and glass.transport.height() == glass.height()
+            sampled_frame(glass.view.frame_geometry[2])
+            after_controls = C.string_at(glass.capture.bits, len(background))
+            assert sum(abs(a - b) for a, b in zip(background, after_controls)) / len(background) < .05
+            location = glass.pos()
+            for action, button in glass.media_buttons.items():
+                assert button.isEnabled() and not button.icon().isNull()
+                QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+                fake_reader.request_command.assert_called_with(action)
+                assert control.media_command_busy and not button.isEnabled()
+                assert glass.pos() == location and glass.drag_anchor is None
+                control.media_command_finished(action, "")
+            assert fake_reader.request_command.call_count == 3
+            if preview_path:
+                origin = W.POINT(); assert client_origin(int(glass.winId()), C.byref(origin))
+                rect = W.RECT(); assert api(user32, "GetClientRect", W.BOOL, W.HWND, C.POINTER(W.RECT))(int(glass.winId()), C.byref(rect))
+                ImageGrab.grab(bbox=(origin.x, origin.y, origin.x + rect.right, origin.y + rect.bottom), all_screens=True).save(str(preview_path.with_name("hover-controls.png")))
+            glass.set_locked(True); glass.reveal_transport(True); QTest.qWait(210)
+            assert not glass.transport.isVisible() and glass.view.control_space == 0
+            glass.set_locked(False)
+            glass.reveal_transport(False); QTest.qWait(210)
+        finally:
+            control.media_reader = original_reader
+            control.set_playback(original_playback)
+        result["media_controls"] = dict(hover_fade=True, lock_hides=True, command_routing=True,
+                                        no_drag=True, private_capture_exclusion=True, shared_glass=True, aligned_outer_corners=True)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
         result["device_pixel_ratio"] = glass.devicePixelRatioF()
@@ -1504,6 +1676,8 @@ def main():
     fmt.setAlphaBufferSize(8); fmt.setDepthBufferSize(0); fmt.setStencilBufferSize(0); fmt.setSamples(0)
     fmt.setSwapInterval(0); QSurfaceFormat.setDefaultFormat(fmt)
     app = QApplication(sys.argv[:1])
+    if load_bundled_font() < 0:
+        LOG.warning("Bundled Noto Sans SC Black unavailable; using installed/system fonts")
     app.setApplicationName("MoonLyrics")
     app.setWindowIcon(application_icon())
     app_id = api(C.WinDLL("shell32"), "SetCurrentProcessExplicitAppUserModelID", C.c_long, W.LPCWSTR)

@@ -44,6 +44,7 @@ class PlaybackSnapshot:
     rate: float = 1.
     observed_at: float = 0.
     message: str = ""
+    controls: tuple = ()
 
     def position_at(self, now=None):
         now = time.perf_counter() if now is None else now

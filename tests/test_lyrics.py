@@ -34,12 +34,12 @@ class ParserTests(TestCase):
 
     def test_scroll_arrives_at_cue_without_a_delayed_animation(self):
         document = Lyrics(tuple(LyricLine(t, "月光") for t in (60, 64, 68, 72)))
-        self.assertEqual(document.scroll_at(67.4), 1.)
-        self.assertAlmostEqual(document.scroll_at(67.725), 1.5)
+        self.assertEqual(document.scroll_at(67.3), 1.)
+        self.assertAlmostEqual(document.scroll_at(67.675), 1.5)
         self.assertEqual(document.scroll_at(68), 2.)
         samples = [document.scroll_at(67 + n / 100) for n in range(151)]
         self.assertTrue(all(b >= a for a, b in zip(samples, samples[1:])))
-        self.assertLess(document.scroll_at(67.451) - document.scroll_at(67.45), .00001)
+        self.assertLess(document.scroll_at(67.351) - document.scroll_at(67.35), .00001)
         self.assertLess(document.scroll_at(68) - document.scroll_at(67.999), .00001)
 
     def test_short_cues_and_first_last_line_are_bounded(self):

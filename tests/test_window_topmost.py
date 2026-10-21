@@ -87,7 +87,9 @@ class WindowTopmostTests(unittest.TestCase):
         self.assertTrue(self.position(int(peer.winId()), -1, 0, 0, 0, 0, 0x13))
         self.assertTrue(self.topmost())
         self.assertTrue(self.peer_above(peer))
-        self.control.sample()
+        with patch.object(native, "set_window_pos", wraps=native.set_window_pos) as position:
+            self.control.sample()
+            position.assert_not_called()
         self.assertTrue(self.peer_above(peer), "The status tick must not fight other topmost windows")
         self.playing("paused")
         self.playing("playing")
@@ -99,7 +101,37 @@ class WindowTopmostTests(unittest.TestCase):
         self.control.sample()
         self.assertTrue(self.topmost(), "The normal status tick did not recover lost topmost state")
 
-    def test_lock_and_show_cycle_preserve_capture_exclusion_and_input_mode(self):
+    def test_idle_tick_recovers_stale_topmost_flag_above_ordinary_windows(self):
+        self.playing("paused")
+        peer = QWidget()
+        self.addCleanup(peer.deleteLater)
+        self.addCleanup(peer.close)
+        peer.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowDoesNotAcceptFocus)
+        peer.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        peer.setGeometry(-30000, -30000, 100, 50)
+        self.demote()
+        peer.show()
+        self.assertTrue(self.position(int(peer.winId()), 0, 0, 0, 0, 0, 0x13))
+        hwnd = int(self.glass.winId())
+        self.assertTrue(self.peer_above(peer))
+        foreground, geometry = self.foreground(), self.glass.geometry()
+        self.assertFalse(self.control.isVisible())
+        read_style = native.get_window_long
+        def stale_flag(window, index):
+            value = read_style(window, index)
+            return value | 0x8 if window == hwnd and index == -20 else value
+        # Windows cannot safely be forced into the live inconsistency; inject only its stale flag.
+        with patch.object(native, "get_window_long", side_effect=stale_flag):
+            self.assertTrue(native.get_window_long(hwnd, -20) & 0x8)
+            self.control.sample()
+        self.assertFalse(self.peer_above(peer), "The idle tick trusted a stale topmost flag")
+        self.assertTrue(self.topmost())
+        self.assertEqual(self.foreground(), foreground)
+        self.assertEqual(self.glass.geometry(), geometry)
+        self.assertTrue(self.glass.paused, "Z-order recovery must not resume paused rendering")
+
+    def test_lock_and_show_cycle_preserve_capture_permission_and_input_mode(self):
         geometry = self.glass.geometry()
         for locked in (True, False):
             self.glass.set_locked(locked)
@@ -109,7 +141,7 @@ class WindowTopmostTests(unittest.TestCase):
             self.assertEqual(bool(self.style(hwnd, -20) & 0x20), locked)
             affinity = W.DWORD()
             self.assertTrue(native.get_affinity(hwnd, C.byref(affinity)))
-            self.assertEqual(affinity.value, 0x11)
+            self.assertEqual(affinity.value, 0)
             self.assertEqual(self.glass.geometry(), geometry)
 
     def test_status_tick_does_not_show_a_hidden_window(self):

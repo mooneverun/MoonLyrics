@@ -35,6 +35,8 @@ VSVersionInfo(
         --add-data "$(Join-Path $PSScriptRoot 'assets\moonlyrics-icon.png');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\settings-chevron.svg');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\settings-check.svg');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\NotoSansSC-Black.otf');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\NotoSansSC-OFL.txt');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'VERSION');." `
         --name MoonLyrics --collect-data opencc --distpath (Join-Path $PSScriptRoot 'dist') `
         --workpath (Join-Path $PSScriptRoot 'build') --specpath (Join-Path $PSScriptRoot 'build') main.py

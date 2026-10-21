@@ -6,6 +6,14 @@ from moonlyrics.styles import DEFAULTS, PRESETS, normalized, transparency_amount
 
 
 class StyleTests(unittest.TestCase):
+    def test_lyric_font_round_trips_and_invalid_preferences_use_default(self):
+        for family in ("Microsoft YaHei UI", "Yu Gothic UI", "맑은 고딕", "A missing font"):
+            settings = normalized(dict(lyric_font=family))
+            self.assertEqual(normalized(json.loads(json.dumps(settings)))["lyric_font"], family)
+        self.assertEqual(normalized(dict(lyric_font="  Segoe UI  "))["lyric_font"], "Segoe UI")
+        for value in (None, [], 42, "", " ", "bad\x00font", "bad\nfont", "x" * 129):
+            self.assertEqual(normalized(dict(lyric_font=value))["lyric_font"], DEFAULTS["lyric_font"])
+
     def test_all_sources_default_to_one_second_and_allow_adjustment_and_reset(self):
         from moonlyrics.lyrics import Lyrics, LyricLine
         document = Lyrics((LyricLine(1, "月光"), LyricLine(2, "落下")))

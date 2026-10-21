@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 from PyQt6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPalette
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPalette
 from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                             QSizeGrip, QVBoxLayout, QWidget)
 
@@ -17,6 +17,33 @@ MATERIALS = {"rich": (32, 44, 63, 230)}
 
 def application_icon():
     return QIcon(str(ASSETS / "moonlyrics-icon.ico"))
+
+
+def media_icon(action, dark=False):
+    image = QPixmap(60, 60)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(2.5, 2.5)
+    path = QPainterPath()
+    if action == "pause":
+        path.addRoundedRect(6, 5, 4, 14, 1, 1)
+        path.addRoundedRect(14, 5, 4, 14, 1, 1)
+    else:
+        if action == "previous":
+            painter.translate(24, 0); painter.scale(-1, 1)
+        if action in ("previous", "next"):
+            path.addRect(20, 6, 2, 12)
+            starts = (3, 11)
+        else:
+            starts = (8,)
+        for x in starts:
+            path.moveTo(x, 5 if action == "play" else 6)
+            path.lineTo(x, 19 if action == "play" else 18)
+            path.lineTo(x + (11 if action == "play" else 9), 12)
+            path.closeSubpath()
+    painter.fillPath(path, QColor("#182632" if dark else "#f1f6ff")); painter.end()
+    return QIcon(image)
 
 
 def native_backdrop(hwnd):

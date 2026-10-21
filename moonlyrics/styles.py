@@ -9,7 +9,7 @@ LYRIC_SOURCES = {"kugou": "酷狗", "lrclib": "LRCLIB", "netease": "网易云", 
 FPS_OPTIONS = (15, 30, 60, 120)
 DEFAULTS = dict(preset="rich", blur=PRESETS["rich"]["blur"], refraction=PRESETS["rich"]["refraction"],
                 transparency_level=1, width=580, height=80, fps=30, storefront="tr", language="zh_CN", lyric_offset_ms=1000, lyric_timing_version=1,
-                lyric_source_order=tuple(LYRIC_SOURCES))
+                lyric_source_order=tuple(LYRIC_SOURCES), lyric_font="Noto Sans SC Black")
 LIMITS = dict(transparency_level=(1, 10), width=(320, 960), height=(80, 240), lyric_offset_ms=(-3000, 3000))
 
 
@@ -40,6 +40,9 @@ def normalized(values):
         result["fps"] = int(values["fps"])
     if isinstance(values.get("language"), str) and values["language"] in LANGUAGES:
         result["language"] = values["language"]
+    family = values.get("lyric_font")
+    if isinstance(family, str) and 0 < len(family.strip()) <= 128 and family.isprintable():
+        result["lyric_font"] = family.strip()
     if values.get("storefront") in ("tr", "cn", "hk", "tw", "us"):
         result["storefront"] = values["storefront"]
     result["lyric_source_order"] = normalized_source_order(values.get("lyric_source_order"))

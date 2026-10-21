@@ -10,6 +10,11 @@ from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from .playback import PlaybackSnapshot, apple_metadata, finite, timeline_anchor
 
 LOG = logging.getLogger("moonlyrics.media")
+COMMANDS = {
+    "previous": ("is_previous_enabled", "try_skip_previous_async"),
+    "toggle": ("is_play_pause_toggle_enabled", "try_toggle_play_pause_async"),
+    "next": ("is_next_enabled", "try_skip_next_async"),
+}
 
 
 def select_apple_session(sessions):
@@ -31,6 +36,7 @@ def select_apple_session(sessions):
 
 class AppleMusicReader(QThread):
     snapshot_changed = pyqtSignal(object)
+    command_finished = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,6 +45,40 @@ class AppleMusicReader(QThread):
         self._session = None
         self._manager = None
         self._revision = 0
+        self._command = None
+        self._command_lock = threading.Lock()
+
+    def request_command(self, action):
+        with self._command_lock:
+            if (action not in COMMANDS or self._command is not None
+                    or not self.isRunning() or self.isInterruptionRequested()):
+                return False
+            self._command = action
+        self.wake.set()
+        return True
+
+    def _finish_command(self, action, message):
+        with self._command_lock:
+            self._command = None
+        self.command_finished.emit(action, message)
+
+    def _send_command(self, session, action):
+        try:
+            if self.isInterruptionRequested():
+                return "播放控制已取消"
+            if session is None or "applemusic" not in session.source_app_user_model_id.casefold():
+                return "未找到正在运行的 Apple Music"
+            flag, method = COMMANDS[action]
+            if not getattr(session.get_playback_info().controls, flag, False):
+                return "Apple Music 暂不支持此操作"
+            if not self._get(getattr(session, method)()):
+                return "Apple Music 未接受控制指令，请重试"
+            return ""
+        except InterruptedError:
+            return "播放控制已取消"
+        except Exception:
+            LOG.warning("Apple Music control failed; action=%s", action, exc_info=True)
+            return "播放控制失败，请重试"
 
     def stop(self):
         self.requestInterruption()
@@ -82,6 +122,8 @@ class AppleMusicReader(QThread):
         properties = self._get(session.try_get_media_properties_async())
         timeline = session.get_timeline_properties()
         playback = session.get_playback_info()
+        controls = getattr(playback, "controls", None)
+        available = tuple(action for action, (flag, _) in COMMANDS.items() if getattr(controls, flag, False))
         now = time.perf_counter()
         status = {0: "closed", 1: "opened", 2: "changing", 3: "stopped",
                   4: "playing", 5: "paused"}.get(int(playback.playback_status), "opened")
@@ -98,7 +140,7 @@ class AppleMusicReader(QThread):
                                              datetime.now(timezone.utc).timestamp(), status, rate)
         return PlaybackSnapshot(source=session.source_app_user_model_id, title=title, artist=artist,
                                 album=album, status=status, position=position, duration=duration,
-                                rate=rate, observed_at=now)
+                                rate=rate, observed_at=now, controls=available)
 
     def run(self):
         try:
@@ -110,6 +152,9 @@ class AppleMusicReader(QThread):
             previous_error = None
             while not self.isInterruptionRequested():
                 self.wake.clear()
+                with self._command_lock:
+                    action = self._command
+                message = "播放控制失败，请重试"
                 try:
                     if self._manager is None:
                         self._manager = self._get(GlobalSystemMediaTransportControlsSessionManager.request_async())
@@ -122,6 +167,8 @@ class AppleMusicReader(QThread):
                         if session is not None:
                             self._subscribe(session, ("media_properties_changed", "playback_info_changed",
                                                       "timeline_properties_changed"))
+                    if action:
+                        message = self._send_command(session, action)
                     revision = self._revision
                     snapshot = self._read(session) if session is not None else PlaybackSnapshot()
                     if revision != self._revision:
@@ -137,6 +184,9 @@ class AppleMusicReader(QThread):
                     previous_error = type(exc).__name__
                     self.snapshot_changed.emit(PlaybackSnapshot(status="unavailable", message=str(exc)))
                     self._unsubscribe(); self._session = None; self._manager = None
+                finally:
+                    if action:
+                        self._finish_command(action, message)
                 # Coalesce bursts of native events, with a half-second heartbeat for missed updates.
                 self.wake.wait(.5)
                 if self.wake.is_set():
@@ -145,6 +195,9 @@ class AppleMusicReader(QThread):
             LOG.exception("Windows media reader could not start")
             self.snapshot_changed.emit(PlaybackSnapshot(status="unavailable", message=str(exc)))
         finally:
+            self.requestInterruption()
+            if self._command:
+                self._finish_command(self._command, "播放控制已取消")
             self._unsubscribe(); self._session = None; self._manager = None
 
 

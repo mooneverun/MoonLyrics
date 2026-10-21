@@ -13,6 +13,7 @@ from moonlyrics.styles import DEFAULTS, normalized
 
 if sys.platform == "win32":
     from PyQt6.QtCore import QEvent, QRect, Qt, QTimer
+    from PyQt6.QtGui import QFont, QFontDatabase
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QStyle, QStyleOptionComboBox
     from moonlyrics import windows as native
@@ -78,6 +79,54 @@ class SettingsControlsTests(unittest.TestCase):
 
     def language(self, code):
         self.control.language.setCurrentIndex(self.control.language.findData(code))
+
+    def test_font_switch_updates_lyrics_without_searching_or_changing_ui_font(self):
+        document = Lyrics((LyricLine(1, "Moonlight 月光 달빛"), LyricLine(8, "下一句")))
+        self.control.set_playback(PlaybackSnapshot(status="paused", position=1, duration=20))
+        self.control.glass.view.set_lyrics(document, 2.)
+        self.control.glass.view.lyric_image_key = object()
+        ui_font = self.control.font().family()
+        family = next(f for f in QFontDatabase.families() if f != DEFAULTS["lyric_font"])
+        with patch.object(self.control, "request_lyrics") as search, \
+                patch.object(self.control.glass.view, "update") as repaint:
+            self.control.font_choice.setCurrentFont(QFont(family))
+            self.assertEqual(self.control.settings["lyric_font"], family)
+            self.assertIsNone(self.control.glass.view.lyric_image_key)
+            repaint.assert_called()
+            for language in LANGUAGES:
+                self.language(language)
+                self.assertEqual(self.control.font_choice.accessibleName(), translate(language, "歌词字体"))
+                self.assertEqual(self.control.font_choice.currentFont().family(), family)
+            search.assert_not_called()
+        self.assertIs(self.control.glass.view.lyrics, document)
+        self.assertEqual(self.control.glass.view.lyric_time, 2.)
+        self.assertEqual(self.control.font().family(), ui_font)
+        restored = normalized(json.loads(json.dumps(self.control.settings)))
+        self.assertEqual(restored["lyric_font"], family)
+        self.assertTrue(self.control.glass.paused)
+
+    def test_short_lines_reuse_the_image_and_long_lines_follow_the_playback_time(self):
+        view = self.control.glass.view
+        view.set_lyrics(Lyrics((LyricLine(1, "月光"), LyricLine(12, "下一句"))), 2.)
+        with patch.object(view, "update") as repaint:
+            for position in (2.1, 2.2, 3.):
+                view.set_lyric_time(position)
+            repaint.assert_not_called()
+        view.set_lyrics(Lyrics((LyricLine(1, "月光" * 60), LyricLine(12, "下一句"))), 2.)
+        with patch.object(view, "update") as repaint:
+            view.set_lyric_time(5.)
+            repaint.assert_called_once()
+            pan = view.pan_position
+            view.set_lyric_time(5.)
+            self.assertEqual(view.pan_position, pan)
+            self.assertEqual(repaint.call_count, 1)
+            view.set_lyric_time(1.)
+            self.assertEqual(view.pan_position, (0, 0.))
+        self.control.set_playback(PlaybackSnapshot(status="paused", position=9.5, duration=10))
+        self.control.glass.view.set_lyrics(Lyrics((LyricLine(1, "月光" * 80),)), 10.)
+        self.control.update_playback_display()
+        self.assertEqual(view.lyric_end_time, 11.)
+        self.assertEqual(view.pan_position, (0, 1.))
 
     def test_live_switch_covers_static_dynamic_and_tray_text_without_searching_again(self):
         self.control.set_playback(PlaybackSnapshot(title="等待 Apple Music", artist="歌手 Artist 가수", album="繁體專輯",
