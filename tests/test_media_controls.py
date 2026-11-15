@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 
 if sys.platform == "win32":
     from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
-    from PyQt6.QtGui import QEnterEvent
-    from PyQt6.QtTest import QTest
+    from PyQt6.QtGui import QEnterEvent, QMouseEvent
+    from PyQt6.QtTest import QSignalSpy, QTest
     from PyQt6.QtWidgets import QApplication
     from moonlyrics import windows as native
     from moonlyrics.i18n import LANGUAGES, translate
@@ -24,8 +24,7 @@ class MediaControlsTests(unittest.TestCase):
         cls.app.setQuitOnLastWindowClosed(False)
 
     def setUp(self):
-        with patch.object(native.QSystemTrayIcon, "show"):
-            self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
+        self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
         for timer in self.control.findChildren(QTimer): timer.stop()
         self.glass = self.control.glass
         self.glass.paused = True
@@ -38,7 +37,7 @@ class MediaControlsTests(unittest.TestCase):
     def tearDown(self):
         for timer in self.control.findChildren(QTimer): timer.stop()
         self.control.media_reader = None
-        self.control.tray.hide(); self.glass.close()
+        self.glass.close()
         self.glass.deleteLater(); self.control.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
@@ -56,7 +55,9 @@ class MediaControlsTests(unittest.TestCase):
         self.assertEqual(self.glass.view.control_space, self.glass.transport.width())
         self.assertEqual(self.glass.view.lyric_width(), self.glass.transport.x())
         self.assertEqual(self.glass.geometry(), geometry)
-        self.app.sendEvent(self.glass, QEvent(QEvent.Type.Leave)); QTest.qWait(210)
+        finished = QSignalSpy(self.glass.transport_animation.finished)
+        self.app.sendEvent(self.glass, QEvent(QEvent.Type.Leave))
+        self.assertTrue(finished.wait(600), "The controls did not finish fading out")
         self.assertFalse(self.glass.transport.isVisible())
         self.assertEqual(self.glass.view.control_space, 0)
         self.assertEqual(self.glass.geometry(), geometry)
@@ -79,6 +80,19 @@ class MediaControlsTests(unittest.TestCase):
                     self.assertGreaterEqual(button.x(), 10)
                     self.assertLessEqual(button.geometry().right(), region.width() - 11)
 
+    def test_drag_and_hover_preserve_the_selected_material(self):
+        self.glass.drag_start = self.glass.pos()
+        self.glass.drag_anchor = QPoint(-29900, -29900)
+        before = self.glass.view.night, self.glass.view.dark_text, self.glass.view.settings["appearance_mode"]
+        event = QMouseEvent(QEvent.Type.MouseMove, QPointF(250, 20), QPointF(-29750, -29980),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        with patch.object(self.glass, "move"):
+            self.glass.mouseMoveEvent(event)
+        self.assertEqual((self.glass.view.night, self.glass.view.dark_text, self.glass.view.settings["appearance_mode"]), before)
+        self.glass.drag_anchor = None
+        self.glass.mouseMoveEvent(event)
+        self.assertEqual((self.glass.view.night, self.glass.view.dark_text, self.glass.view.settings["appearance_mode"]), before)
+
     def test_icons_follow_the_glass_contrast_and_keep_the_actual_playback_state(self):
         for dark in (True, False):
             self.glass.view.dark_text = dark
@@ -97,15 +111,11 @@ class MediaControlsTests(unittest.TestCase):
         self.glass.view.dark_text = True; self.glass.view.tone_changed.emit()
         self.assertEqual(self.glass.media_buttons["toggle"].icon().cacheKey(), self.glass.media_icons["play"].cacheKey())
 
-    def test_lock_hides_controls_and_preserves_click_through(self):
+    def test_controls_remain_available_without_a_click_through_mode(self):
         self.enter(); QTest.qWait(210)
-        self.glass.set_locked(True); QTest.qWait(30)
-        self.enter(); QTest.qWait(210)
-        self.assertFalse(self.glass.transport.isVisible())
-        self.assertEqual(self.glass.view.control_space, 0)
-        self.assertTrue(self.glass.windowFlags() & Qt.WindowType.WindowTransparentForInput)
-        self.glass.set_locked(False); self.enter(); QTest.qWait(210)
         self.assertTrue(self.glass.transport.isVisible())
+        self.assertFalse(self.glass.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+        self.assertFalse(hasattr(self.glass, 'set_locked'))
 
     def test_buttons_send_once_without_drag_and_wait_for_completion(self):
         self.enter(); QTest.qWait(210)

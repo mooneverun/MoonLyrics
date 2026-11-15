@@ -27,8 +27,7 @@ class WindowTopmostTests(unittest.TestCase):
         cls.foreground = native.api(native.user32, "GetForegroundWindow", W.HWND)
 
     def setUp(self):
-        with patch.object(native.QSystemTrayIcon, "show"):
-            self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
+        self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
         for timer in self.control.findChildren(QTimer):
             timer.stop()
         self.glass = self.control.glass
@@ -41,7 +40,6 @@ class WindowTopmostTests(unittest.TestCase):
     def tearDown(self):
         for timer in self.control.findChildren(QTimer):
             timer.stop()
-        self.control.tray.hide()
         self.glass.close()
         self.glass.deleteLater()
         self.control.deleteLater()
@@ -131,14 +129,14 @@ class WindowTopmostTests(unittest.TestCase):
         self.assertEqual(self.glass.geometry(), geometry)
         self.assertTrue(self.glass.paused, "Z-order recovery must not resume paused rendering")
 
-    def test_lock_and_show_cycle_preserve_capture_permission_and_input_mode(self):
+    def test_hide_and_show_cycles_preserve_capture_permission_and_mouse_input(self):
         geometry = self.glass.geometry()
-        for locked in (True, False):
-            self.glass.set_locked(locked)
+        for _ in range(2):
+            self.glass.hide(); self.glass.show()
             QTest.qWait(30)
             hwnd = int(self.glass.winId())
             self.assertTrue(self.topmost())
-            self.assertEqual(bool(self.style(hwnd, -20) & 0x20), locked)
+            self.assertFalse(self.style(hwnd, -20) & 0x20)
             affinity = W.DWORD()
             self.assertTrue(native.get_affinity(hwnd, C.byref(affinity)))
             self.assertEqual(affinity.value, 0)

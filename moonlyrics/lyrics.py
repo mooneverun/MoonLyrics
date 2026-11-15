@@ -1516,7 +1516,7 @@ class LyricsFinder:
                 if result is None:
                     result = self._search_sources(aliases, providers if aliases != base_aliases else providers[1:], reserve=12.)
             if result is None:
-                expanded = self._run_stage(self._album_aliases, track, storefront, aliases, budget=5.) or aliases
+                expanded = (self._run_stage(self._album_aliases, track, storefront, aliases, budget=5.) or aliases) if "netease" in order else aliases
                 if expanded != aliases:
                     aliases = expanded
                     result = self._run_stage(self._resolve_candidates, aliases, order, budget=2.)
@@ -1533,7 +1533,7 @@ class LyricsFinder:
                         self.failures.add("Apple artist catalog")
                 result = self._run_stage(self._resolve_candidates, aliases, order, deep=True, budget=5.)
             if result is None:
-                expanded = self._run_stage(self._catalog_aliases, aliases, budget=2.) or aliases
+                expanded = (self._run_stage(self._catalog_aliases, aliases, budget=2.) or aliases) if "kugou" in order else aliases
                 if expanded != aliases:
                     result = self._search_sources(expanded, providers, tolerance=2)
                     if result is not None:

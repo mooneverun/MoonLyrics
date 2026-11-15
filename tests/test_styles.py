@@ -2,10 +2,23 @@ import json
 import unittest
 import moonlyrics.styles as style_settings
 
-from moonlyrics.styles import DEFAULTS, PRESETS, normalized, transparency_amount
+from moonlyrics.styles import DEFAULTS, PRESETS, normalized
 
 
 class StyleTests(unittest.TestCase):
+    def test_appearance_modes_round_trip_and_migrate_old_transparency(self):
+        self.assertEqual(DEFAULTS["appearance_mode"], "system")
+        for mode in ("day", "night", "system"):
+            settings = normalized(dict(appearance_mode=mode, transparency_level=47, transparency_scale=100))
+            self.assertEqual(settings["appearance_mode"], mode)
+            self.assertNotIn("transparency_level", settings)
+            self.assertEqual(normalized(json.loads(json.dumps(settings))), settings)
+        for invalid in (None, [], "unknown"):
+            self.assertEqual(normalized(dict(appearance_mode=invalid))["appearance_mode"], "system")
+        previous = normalized(dict(transparency_level=47, transparency_scale=100, lyric_font="Segoe UI", width=640))
+        self.assertEqual((previous["appearance_mode"], previous["lyric_font"], previous["width"]),
+                         ("system", "Segoe UI", 640))
+
     def test_lyric_font_round_trips_and_invalid_preferences_use_default(self):
         for family in ("Microsoft YaHei UI", "Yu Gothic UI", "맑은 고딕", "A missing font"):
             settings = normalized(dict(lyric_font=family))
@@ -27,31 +40,11 @@ class StyleTests(unittest.TestCase):
             settings["lyric_offset_ms"] = DEFAULTS["lyric_offset_ms"]
             self.assertEqual(style_settings.lyric_offset_seconds(settings), 1)
 
-    def test_fixed_rich_material_migrates_legacy_styles_and_preserves_controls(self):
-        self.assertEqual(set(PRESETS), {"rich"})
-        for previous in ("clear", "soft", "rich", "unknown", [], None):
-            result = normalized(dict(preset=previous, blur=100, refraction=100, width=640, transparency_level=7))
-            self.assertEqual(result["preset"], "rich")
-            self.assertEqual(result["blur"], PRESETS["rich"]["blur"])
-            self.assertEqual(result["refraction"], PRESETS["rich"]["refraction"])
-            self.assertEqual(result["width"], 640)
-            self.assertEqual(result["transparency_level"], 7)
-            self.assertEqual(normalized(json.loads(json.dumps(result))), result)
-
-    def test_transparency_mapping_and_legacy_settings(self):
-        self.assertEqual(transparency_amount(1), .9)
-        self.assertEqual(transparency_amount(10), 1.)
-        self.assertEqual(normalized(dict(transparency=90))["transparency_level"], 1)
-        self.assertEqual(normalized(dict(transparency=100))["transparency_level"], 10)
-        self.assertEqual(normalized(dict(transparency_level=4, transparency=100))["transparency_level"], 4)
-        amounts = [transparency_amount(i) for i in range(1, 11)]
-        self.assertTrue(all(a < b for a, b in zip(amounts, amounts[1:])))
-
     def test_invalid_settings_and_bounds(self):
         self.assertEqual(normalized(None), DEFAULTS)
         self.assertEqual(normalized(dict(preset=[], fps=1000, width=float("nan"))), DEFAULTS)
         result = normalized(dict(transparency_level=100, width=-1, height=1000))
-        self.assertEqual((result["transparency_level"], result["width"], result["height"]), (10, 320, 240))
+        self.assertEqual((result["width"], result["height"]), (320, 240))
 
     def test_lyric_calibration_is_preserved_and_bounded(self):
         self.assertEqual(normalized({})["lyric_offset_ms"], 1000)
@@ -69,9 +62,13 @@ class StyleTests(unittest.TestCase):
         self.assertEqual(normalized(json.loads(json.dumps(explicit_zero))), explicit_zero)
 
     def test_lyric_source_order_is_saved_and_invalid_orders_use_defaults(self):
-        order = ("qq", "netease", "lrclib", "kugou")
+        order = ("qq", "netease", "lrclib")
         settings = normalized(dict(lyric_source_order=order))
         self.assertEqual(normalized(json.loads(json.dumps(settings)))["lyric_source_order"], order)
+        self.assertEqual(normalized(dict(lyric_source_order=order+("kugou",)))["lyric_source_order"], order)
+        for reserve in style_settings.LYRIC_SOURCES:
+            active = tuple(source for source in style_settings.LYRIC_SOURCES if source != reserve)
+            self.assertEqual(normalized(dict(lyric_source_order=active))["lyric_source_order"], active)
         for invalid in (None, [], "qq", ["qq"] * 4, ["qq", "netease", "lrclib", "unknown"],
                         ["qq", "netease", "lrclib", []]):
             self.assertEqual(normalized(dict(lyric_source_order=invalid))["lyric_source_order"], DEFAULTS["lyric_source_order"])

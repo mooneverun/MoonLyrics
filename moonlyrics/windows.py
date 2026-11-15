@@ -11,6 +11,7 @@ import statistics
 import struct
 import sys
 import time
+import winreg
 
 from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QSurfaceFormat, QVector2D, QVector4D
@@ -18,11 +19,12 @@ from PyQt6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject,
                            QOpenGLShader, QOpenGLShaderProgram,
                            QOpenGLTimerQuery, QOpenGLVertexArrayObject)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFontComboBox, QGraphicsOpacityEffect, QGridLayout,
-                            QHBoxLayout, QLabel, QMenu, QMessageBox, QProgressBar, QPushButton,
-                            QSizePolicy, QSlider, QSystemTrayIcon, QToolButton, QToolTip, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QComboBox, QFontComboBox, QGraphicsOpacityEffect, QGridLayout,
+                            QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
+                            QSizePolicy, QSlider, QToolButton, QToolTip, QVBoxLayout, QWidget)
 
-from .styles import DEFAULTS, LIMITS, PRESETS, LYRIC_SOURCES, FPS_OPTIONS, normalized, transparency_amount, lyric_offset_seconds
+from .styles import DEFAULTS, LIMITS, PRESETS, APPEARANCE_MODES, LYRIC_SOURCES, FPS_OPTIONS, normalized, lyric_offset_seconds
+from .glass_material import GLASS, LENS, background_tone, sample_background
 from . import __version__
 from .i18n import LANGUAGES, TEXTS, translate, translate_message
 from .playback import LyricClock, PlaybackSnapshot, STATUS_LABELS, format_time
@@ -31,9 +33,13 @@ from .lyrics import Lyrics, LyricLine, Track, lyrics_probe, normalize
 from .lyrics_worker import LyricsWorker
 from .lyric_paint import load_bundled_font, lyric_font, lyric_layer, lyric_pan
 from .settings_ui import SettingsWindow, application_icon, media_icon
-from .windows_capture import DesktopRegion, api
+from .settings_content import build_settings, SHORT_MODES, POSITION_LABELS
+from .settings_icons import settings_icon
+from .windows_capture import DesktopRegion, api, client_origin
+from .storage import application_directory, data_directory
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "MoonLyrics"
+PREFERRED_APP_DIR = APP_DIR
 LEGACY_DIR = APP_DIR.parent / "LyricFloatGlassSample"
 LOG = logging.getLogger("moonlyrics")
 user32, kernel32, psapi = (C.WinDLL(n, use_last_error=True) for n in ("user32", "kernel32", "psapi"))
@@ -84,6 +90,15 @@ class Usage:
         return percent, mem.working_set / (1024 ** 2)
 
 
+def system_is_dark():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return not bool(winreg.QueryValueEx(key, "AppsUseLightTheme")[0])
+    except OSError:
+        return QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+
+
 VERTEX = """#version 330 core
 layout(location=0) in vec2 aPosition;
 layout(location=1) in vec2 aUv;
@@ -97,68 +112,49 @@ uniform vec2 uAxis;
 uniform float uSigma;
 uniform int uRadius;
 uniform vec4 uBounds;
+uniform float uFlipY;
 void main() {
     vec3 sum=vec3(0); float total=0;
     for(int i=-uRadius;i<=uRadius;i++) {
         float x=float(i)/uSigma, weight=exp(-0.5*x*x);
-        vec2 p=clamp(uv+uAxis*float(i),uBounds.xy,uBounds.zw);
+        vec2 center=vec2(uv.x,mix(uv.y,1.-uv.y,uFlipY));
+        vec2 p=clamp(center+uAxis*float(i),uBounds.xy,uBounds.zw);
         sum+=texture(uSource,p).rgb*weight; total+=weight;
     }
     outputColor=vec4(sum/total,1);
 }
 """
-GLASS = """#version 330 core
-in vec2 uv; out vec4 outputColor;
-uniform sampler2D uSource;
-uniform vec2 uFrameSize, uCaptureSize, uLight;
-uniform vec4 uBounds;
-uniform float uPadding,uDpr,uRefraction,uTransparency;
-void main() {
-    vec2 p=(uv-0.5)*uFrameSize;
-    float radius=min(24.0*uDpr,uFrameSize.y*0.5);
-    vec2 q=abs(p)-uFrameSize*0.5+radius;
-    vec2 outside=max(q,0.0);
-    float len=length(outside);
-    float sdf=len+min(max(q.x,q.y),0.0)-radius;
-    float depth=max(0.0,-sdf);
-    vec2 normal=len>0.001 ? outside/len : (q.x>q.y ? vec2(1,0):vec2(0,1));
-    normal*=sign(p);
-    float t=depth/(23.0*uDpr);
-    float profile=(t>0.0 && t<1.0) ? sin(t*3.14159265):0.0;
-    vec2 offset=normal*profile*uRefraction*32.0*uDpr;
-    vec2 sampleUv=(uv*uFrameSize+uPadding+offset)/uCaptureSize;
-    vec3 color=texture(uSource,clamp(sampleUv,uBounds.xy,uBounds.zw)).rgb;
-    color=mix(color,vec3(0.10,0.16,0.22),1.0-uTransparency);
-    vec2 light=normalize(uLight+vec2(0.001));
-    float rim=1.0-smoothstep(0.3*uDpr,1.5*uDpr,depth);
-    float facing=0.12+0.88*max(0.0,dot(normal,light));
-    color+=vec3(0.81,0.91,1.0)*(rim*facing*0.25+exp(-depth/(4.0*uDpr))*0.025);
-    float visible=1.0-smoothstep(0.90,1.0,uTransparency);
-    float alpha=(1.0-smoothstep(-0.7,0.7,sdf))*visible;
-    outputColor=vec4(color*alpha,alpha);
-}
-"""
-
-
 class GlassView(QOpenGLWidget):
     failed = pyqtSignal(str)
     tone_changed = pyqtSignal()
 
-    def __init__(self, settings, capture, parent):
+    def __init__(self, settings, capture, parent, *, settings_surface=False):
         super().__init__(parent)
         self.settings, self.capture = settings, capture
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.settings_surface = settings_surface
+        self.corner_radius = 30. if settings_surface else 0.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,not settings_surface)
         self.ready = False
         self.new_frame = False
         self.frame_geometry = None
         self.texture_size = (0, 0)
+        self.texture_rect = None
+        self.texture_bounds = (0., 0., 1., 1.)
+        self.texture_top_down = False
+        self.scene_key = None
+        self.pixel_key = None
+        self.background_changed = False
+        self.uploaded_revision = None
+        self.blur_key = None
         self.fbos = []
+        self.lens_fbo = None
+        self.lens_size = (0, 0)
         self.texture = C.c_uint(0)
         self.frames = 0
         self.capture_ms = 0.
         self.gpu_ms = None
         self.gpu_pending = False
-        self.show_text = True
+        self.show_text = not settings_surface
         self.primary_text = "等待 Apple Music"
         self.secondary_text = "播放音乐后显示歌曲与进度"
         self.lyrics = None
@@ -169,27 +165,32 @@ class GlassView(QOpenGLWidget):
         self.control_space = 0
         self.lyric_index = -1
         self.lyric_image_key = None
-        self.dark_text = False
+        self.dark_text = True
+        self.night = None
+        self.background_colors = ()
+        self.tint_alpha = background_tone((), False)
         self.renderer = "正在初始化显卡…"
-        self.light = QVector2D(-.7, .8)
-        self.transparency = transparency_amount(settings["transparency_level"])
-        self.transparency_animation = QVariantAnimation(self)
-        self.transparency_animation.setDuration(240)
-        self.transparency_animation.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self.transparency_animation.valueChanged.connect(self.animate_transparency)
+        self.update_appearance()
+        QApplication.styleHints().colorSchemeChanged.connect(self.update_appearance)
         self.frameSwapped.connect(self.swapped)
 
-    def set_transparency(self, level):
-        self.transparency_animation.stop()
-        target = transparency_amount(level)
-        if abs(target - self.transparency) < 1e-8:
-            return
-        self.transparency_animation.setStartValue(self.transparency)
-        self.transparency_animation.setEndValue(target)
-        self.transparency_animation.start()
+    def update_appearance(self):
+        mode = self.settings["appearance_mode"]
+        night = mode == "night" or (mode == "system" and system_is_dark())
+        self.set_night(night)
 
-    def animate_transparency(self, value):
-        self.transparency = float(value)
+    def material_tone(self, colors, night):
+        floor = (.40 if night else .56) if self.settings_surface else 0.
+        return max(floor, background_tone(colors, night))
+
+    def set_night(self, night):
+        if self.night == night:
+            return
+        self.night = night
+        self.dark_text = not night
+        self.tint_alpha = self.material_tone(self.background_colors, night)
+        self.lyric_image_key = None
+        self.tone_changed.emit()
         self.update()
 
     def swapped(self):
@@ -200,6 +201,8 @@ class GlassView(QOpenGLWidget):
 
     def set_lyrics(self, document, position=0.):
         self.lyrics = document
+        if document is None:
+            self.lyric_image = None
         self.lyric_time = position
         self.lyric_end_time = None
         self.lyric_index = document.index_at(position) if document else -1
@@ -243,7 +246,8 @@ class GlassView(QOpenGLWidget):
             self.active_texture = C.WINFUNCTYPE(None, C.c_uint)(get_proc(b"glActiveTexture"))
             self.renderer = self.gl.glGetString(0x1F01).decode("utf-8", errors="replace")
             LOG.info("Renderer: %s; OpenGL: %s", self.renderer, self.gl.glGetString(0x1F02))
-            self.blur_program, self.glass_program = (self.program(fragment) for fragment in (BLUR, GLASS))
+            self.blur_program, self.glass_program, self.lens_program = (
+                self.program(fragment) for fragment in (BLUR, GLASS, LENS))
             self.vao, self.vbo = QOpenGLVertexArrayObject(self), QOpenGLBuffer()
             if not self.vao.create() or not self.vbo.create():
                 raise RuntimeError("无法创建显卡绘制缓冲区")
@@ -264,6 +268,7 @@ class GlassView(QOpenGLWidget):
             self.query = QOpenGLTimerQuery(self)
             self.query_enabled = self.query.create()
             self.ready = True
+            self.context().aboutToBeDestroyed.connect(self.shutdown, Qt.ConnectionType.DirectConnection)
         except Exception as exc:
             LOG.exception("OpenGL initialization failed")
             QTimer.singleShot(0, lambda message=str(exc): self.failed.emit(message))
@@ -276,37 +281,50 @@ class GlassView(QOpenGLWidget):
             raise RuntimeError(program.log())
         return program
 
-    def take_frame(self):
+    def take_frame(self, refresh=True):
         started = time.perf_counter()
+        self.background_changed = False
         dpr = self.devicePixelRatioF()
-        pad = math.ceil((self.settings["blur"] * .72 + self.settings["refraction"] * .32 + 4) * dpr)
-        geometry = self.capture.capture(int(self.window().winId()), pad)
+        pad = math.ceil(12 * dpr)
+        hwnd = int(self.window().winId())
+        dragging = (getattr(self.window(), "drag_anchor", None) is not None
+                    or getattr(self.window(), "backdrop_dragging", False))
+        options = dict(margin=math.ceil(256*dpr)) if dragging else {}
+        if not refresh:
+            options["refresh"] = False
+        geometry = self.capture.capture(hwnd, pad, **options)
         if geometry is None:
             return False
         self.frame_geometry = geometry
         fw, fh, _ = self.frame_geometry
         cw, ch = self.capture.size
-        luminance = 0.
-        for step in range(12):
-            x, y = pad + (step + 1) * fw // 13, pad + fh // 2
-            pixel = (C.c_ubyte * 4).from_address(self.capture.bits.value + ((ch - 1 - y) * cw + x) * 4)
-            luminance += .2126 * pixel[2] + .7152 * pixel[1] + .0722 * pixel[0]
-        amount = transparency_amount(self.settings["transparency_level"])
-        luminance = luminance / 12 * amount + 38 * (1 - amount)
-        previous_tone = self.dark_text
-        if luminance > 165: self.dark_text = True
-        elif luminance < 135: self.dark_text = False
-        if previous_tone != self.dark_text: self.tone_changed.emit()
+        ox, oy = getattr(self.capture, "offset", (pad, pad))
+        revision = getattr(self.capture, "revision", None)
+        pixel_key = (revision, cw, ch)
+        scene_key = (pixel_key, geometry, ox, oy)
+        self.background_changed = revision is None or pixel_key != self.pixel_key
         self.capture_ms = self.capture.capture_ms + (time.perf_counter() - started) * 1000
-        self.new_frame = True
+        if revision is not None and scene_key == self.scene_key:
+            return True
+        pixels = getattr(self.capture, "buffer", None)
+        if pixels is None:
+            pixels = (C.c_ubyte * (cw*ch*4)).from_address(self.capture.bits.value)
+        colors = sample_background(pixels, (cw, ch), (fw, fh), (ox, oy), dpr,
+                                   getattr(self.capture, "top_down", False))
+        self.background_colors = colors
+        self.tint_alpha = self.material_tone(colors, self.night)
+        self.capture_ms = self.capture.capture_ms + (time.perf_counter() - started) * 1000
+        self.new_frame |= revision is None or revision != self.uploaded_revision
+        self.scene_key, self.pixel_key = scene_key, pixel_key
         self.update()
         return True
 
     def draw(self, program, source, width, height):
         self.gl.glViewport(0, 0, width, height)
-        self.active_texture(0x84C0)
-        self.gl.glBindTexture(0x0DE1, source)
-        program.setUniformValue("uSource", 0)
+        if source is not None:
+            self.active_texture(0x84C0)
+            self.gl.glBindTexture(0x0DE1, source)
+            program.setUniformValue("uSource", 0)
         self.gl.glDrawArrays(0x0004, 0, 6)
 
     def paintGL(self):
@@ -349,34 +367,74 @@ class GlassView(QOpenGLWidget):
                         self.gl.glTexParameteri(0x0DE1, key, value)
             else:
                 self.gl.glTexSubImage2D(0x0DE1, 0, 0, 0, cw, ch, 0x80E1, 0x1401, self.capture.bits)
+            self.texture_rect = getattr(self.capture, "source_rect", None)
+            self.texture_top_down = getattr(self.capture, "top_down", False)
+            self.texture_bounds = self.capture.bounds
+            self.uploaded_revision = getattr(self.capture, "revision", None)
+            self.blur_key = None
             self.new_frame = False
         source = self.texture.value
-        bounds = QVector4D(*self.capture.bounds)
-        if self.settings["blur"] > 0:
-            program = self.blur_program
-            program.bind(); program.setUniformValue("uBounds", bounds)
-            sigma = self.settings["blur"] * .24 * self.devicePixelRatioF()
-            spacing = max(1., 3 * sigma / 128)
-            program.setUniformValue("uSigma", float(sigma / spacing))
-            program.setUniformValue("uRadius", min(128, math.ceil(3 * sigma / spacing)))
-            for index, fbo in enumerate(self.fbos):
-                fbo.bind()
-                program.setUniformValue("uAxis", QVector2D(spacing / cw, 0) if index == 0 else QVector2D(0, spacing / ch))
-                self.draw(program, source, fbo.width(), fbo.height())
-                source = fbo.texture()
-            program.release()
-        self.bind_fbo(0x8D40, self.defaultFramebufferObject())
+        bounds = QVector4D(*self.texture_bounds)
+        sigma = 2.
+        if sigma > .01:
+            sigma *= self.devicePixelRatioF()
+            if self.blur_key != sigma:
+                program = self.blur_program
+                program.bind(); program.setUniformValue("uBounds", bounds)
+                spacing = max(1., 3 * sigma / 128)
+                program.setUniformValue("uSigma", float(sigma / spacing))
+                program.setUniformValue("uRadius", min(128, math.ceil(3 * sigma / spacing)))
+                for index, fbo in enumerate(self.fbos):
+                    fbo.bind()
+                    program.setUniformValue("uFlipY", float(index == 0 and self.texture_top_down))
+                    program.setUniformValue("uAxis", QVector2D(spacing / cw, 0) if index == 0 else QVector2D(0, spacing / ch))
+                    self.draw(program, source, fbo.width(), fbo.height())
+                    source = fbo.texture()
+                program.release()
+                self.blur_key = sigma
+            source = self.fbos[-1].texture()
         fw, fh, pad = self.frame_geometry
+        size = (max(1, round(fw / self.devicePixelRatioF())),
+                max(1, round(fh / self.devicePixelRatioF())))
+        rim = max(4, round(min(40., min(size) / 3.5)))
+        if self.lens_size != size:
+            self.lens_fbo = QOpenGLFramebufferObject(*size)
+            if not self.lens_fbo.isValid():
+                raise RuntimeError("无法创建显卡绘制缓冲区")
+            self.lens_fbo.bind()
+            program = self.lens_program
+            program.bind()
+            program.setUniformValue("uSize", QVector2D(*size))
+            program.setUniformValue("uRim", float(rim))
+            program.setUniformValue("uCornerRadius", self.corner_radius)
+            self.draw(program, None, *size)
+            program.release()
+            self.active_texture(0x84C1)
+            self.gl.glBindTexture(0x0DE1, self.lens_fbo.texture())
+            for key, value in ((0x2801, 0x2601), (0x2800, 0x2601), (0x2802, 0x812F), (0x2803, 0x812F)):
+                self.gl.glTexParameteri(0x0DE1, key, value)
+            self.lens_size = size
+        self.bind_fbo(0x8D40, self.defaultFramebufferObject())
         program = self.glass_program
         program.bind()
         program.setUniformValue("uFrameSize", QVector2D(fw, fh))
         program.setUniformValue("uCaptureSize", QVector2D(cw, ch))
         program.setUniformValue("uBounds", bounds)
-        program.setUniformValue("uPadding", float(pad))
+        sample_origin = QVector2D(pad, pad)
+        if self.texture_rect is not None:
+            point = W.POINT()
+            if not client_origin(int(self.window().winId()), C.byref(point)):
+                raise C.WinError(C.get_last_error())
+            sample_origin = QVector2D(point.x-self.texture_rect[1], self.texture_rect[2]+ch-point.y-fh)
+        program.setUniformValue("uOrigin", sample_origin)
         program.setUniformValue("uDpr", float(self.devicePixelRatioF()))
-        program.setUniformValue("uRefraction", self.settings["refraction"] / 100.)
-        program.setUniformValue("uTransparency", self.transparency)
-        program.setUniformValue("uLight", self.light)
+        program.setUniformValue("uNight", float(self.night))
+        program.setUniformValue("uTintAlpha", float(self.tint_alpha))
+        program.setUniformValue("uRim", float(rim))
+        program.setUniformValue("uCornerRadius", self.corner_radius)
+        self.active_texture(0x84C1)
+        self.gl.glBindTexture(0x0DE1, self.lens_fbo.texture())
+        program.setUniformValue("uLens", 1)
         self.draw(program, source, fw, fh)
         program.release(); self.vao.release()
         if measure:
@@ -388,11 +446,17 @@ class GlassView(QOpenGLWidget):
             key = (id(self.lyrics), self.scroll_position, pan, width, self.height(), self.devicePixelRatioF(), self.dark_text, family)
             if key != self.lyric_image_key:
                 self.lyric_image = lyric_layer(self.lyrics, self.scroll_position, width, self.height(),
-                                               self.devicePixelRatioF(), self.dark_text, family, pan)
+                                               self.devicePixelRatioF(), self.dark_text, family, pan, glass=True,
+                                               target=getattr(self, "lyric_image", None))
                 self.lyric_image_key = key
-            painter = QPainter(self); painter.drawImage(0, 0, self.lyric_image); painter.end()
+            painter = QPainter(self)
+            if self.night:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+            painter.drawImage(0, 0, self.lyric_image); painter.end()
         elif self.show_text:
             painter = QPainter(self)
+            if self.night:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
             font = lyric_font(self.settings["lyric_font"])
             painter.setFont(font)
@@ -400,32 +464,46 @@ class GlassView(QOpenGLWidget):
             center = QRectF(16, self.height() / 2 - 28, width - 32, 36)
             title = painter.fontMetrics().elidedText(self.primary_text, Qt.TextElideMode.ElideRight,
                                                      max(1, width - 32))
-            painter.setPen(QColor(255, 255, 255, 36) if self.dark_text else QColor(0, 0, 0, 42))
-            painter.drawText(center.translated(0, 1), Qt.AlignmentFlag.AlignCenter, title)
-            painter.setPen(QColor(24, 38, 50) if self.dark_text else QColor(250, 253, 255))
+            painter.setPen(QColor(0, 0, 0, 219) if self.dark_text else QColor(255, 255, 255, 240))
             painter.drawText(center, Qt.AlignmentFlag.AlignCenter, title)
             font.setPixelSize(13); painter.setFont(font)
             subtitle = painter.fontMetrics().elidedText(self.secondary_text, Qt.TextElideMode.ElideRight,
                                                         max(1, width - 32))
-            painter.setPen(QColor(24, 38, 50, 200) if self.dark_text else QColor(250, 253, 255, 220))
+            painter.setPen(QColor(0, 0, 0, 153) if self.dark_text else QColor(255, 255, 255, 163))
             painter.drawText(QRectF(16, self.height() / 2 + 9, width - 32, 23),
                              Qt.AlignmentFlag.AlignCenter, subtitle)
             painter.end()
 
-    def shutdown(self):
-        self.transparency_animation.stop()
+    def release_material_frame(self):
+        """Drop hidden panel pixels while keeping its working GL composition intact."""
         if not self.ready:
             return
         self.makeCurrent()
-        self.query.destroy(); self.fbos = []
+        try:
+            self.fbos = []; self.lens_fbo = None
+            self.gl.glBindTexture(0x0DE1, self.texture.value)
+            self.gl.glTexImage2D(0x0DE1,0,0x8058,1,1,0,0x80E1,0x1401,None)
+            self.texture_size = self.lens_size = (0,0)
+            self.frame_geometry = self.texture_rect = None
+            self.scene_key = self.pixel_key = self.blur_key = self.uploaded_revision = None
+            self.new_frame = False
+        finally:
+            self.doneCurrent()
+
+    def shutdown(self):
+        if not self.ready:
+            return
+        self.makeCurrent()
+        self.query.destroy(); self.fbos = []; self.lens_fbo = None
         self.gl.glDeleteTextures(1, C.byref(self.texture))
         self.vbo.destroy(); self.vao.destroy()
-        self.blur_program.removeAllShaders(); self.glass_program.removeAllShaders()
+        self.blur_program.removeAllShaders(); self.glass_program.removeAllShaders(); self.lens_program.removeAllShaders()
         self.ready = False
         self.doneCurrent()
 
 
 class GlassWindow(QWidget):
+    settings_requested = pyqtSignal()
     failed = pyqtSignal(str)
     capture_status_changed = pyqtSignal(bool)
     media_command = pyqtSignal(str)
@@ -445,13 +523,18 @@ class GlassWindow(QWidget):
         layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.addWidget(self.view)
         self.timer = QTimer(self); self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.refresh)
+        self.move_refresh = QTimer(self)
+        self.move_refresh.setSingleShot(True)
+        self.move_refresh.timeout.connect(lambda: self.refresh(moving=True))
         self.paused = False
         self.retry_delay = 0
         self.capture_needs_reset = False
         self.drag_anchor = None
-        self.locked = False
+        self.playback_active = False
+        self.background_changed_at = time.monotonic()
         self.transport = QWidget(self)
         self.transport.setObjectName("lyricTransport")
+        self.transport.installEventFilter(self)
         self.transport.setFixedWidth(136)
         self.transport.setCursor(Qt.CursorShape.ArrowCursor)
         self.transport.setStyleSheet("""
@@ -470,6 +553,7 @@ class GlassWindow(QWidget):
         self.media_buttons = {}
         for action in ("previous", "toggle", "next"):
             button = QToolButton(self.transport)
+            button.installEventFilter(self)
             button.setIcon(self.media_icons["play" if action == "toggle" else action])
             button.setIconSize(QSize(20, 20)); button.setFixedSize(36, 36)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -490,6 +574,11 @@ class GlassWindow(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.resize(settings["width"], settings["height"])
 
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, "move_refresh") and not self.paused and not self.retry_delay:
+            self.move_refresh.start(0)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "transport"):
@@ -506,7 +595,7 @@ class GlassWindow(QWidget):
             self.transport.hide()
 
     def reveal_transport(self, visible):
-        visible = visible and not self.locked and self.drag_anchor is None
+        visible = visible and self.drag_anchor is None
         self.transport_animation.stop()
         self.transport.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not visible)
         if visible:
@@ -536,7 +625,7 @@ class GlassWindow(QWidget):
             return
         self.ensure_topmost(force=True)
         if not self.paused:
-            self.timer.start(self.retry_delay or round(1000 / self.settings["fps"]))
+            self.timer.start(self.retry_delay or self.refresh_interval())
         LOG.info("Lyric window is capturable; backdrop uses a local exclusion filter; HWND=%s", hwnd)
 
     def ensure_topmost(self, *, force=False):
@@ -572,7 +661,22 @@ class GlassWindow(QWidget):
                  hwnd, was_topmost, force, ordinary_above)
         return True
 
-    def refresh(self):
+    def refresh_interval(self):
+        recent = time.monotonic()-self.background_changed_at < .75
+        limit = self.settings["fps"]
+        rate = limit if recent or self.drag_anchor is not None else min(limit, 30 if self.playback_active else 15)
+        return round(1000/rate)
+
+    def update_refresh_schedule(self, *, wake=False):
+        if wake:
+            self.background_changed_at = time.monotonic()
+        if self.paused or self.retry_delay or not self.isVisible():
+            return
+        interval = self.refresh_interval()
+        if not self.timer.isActive() or self.timer.interval() != interval:
+            self.timer.start(interval)
+
+    def refresh(self, *, moving=False):
         if self.paused or self.isMinimized() or not self.isVisible():
             return
         try:
@@ -580,7 +684,14 @@ class GlassWindow(QWidget):
                 self.capture.reset()
                 self.capture_needs_reset = False
                 self.timer.start(round(1000 / self.settings["fps"]))
-            if self.view.take_frame() is False:
+            fresh = self.view.take_frame(refresh=False) if moving else self.view.take_frame()
+            if self.view.background_changed:
+                self.background_changed_at = time.monotonic()
+            if not moving:
+                self.update_refresh_schedule()
+            if fresh is False:
+                if moving:
+                    self.view.update()
                 return
         except OSError:
             self.view.new_frame = False
@@ -598,7 +709,7 @@ class GlassWindow(QWidget):
                 self.retry_delay = 0
                 LOG.info("Desktop capture recovered after rebuilding native resources")
                 self.capture_status_changed.emit(False)
-                self.timer.start(round(1000 / self.settings["fps"]))
+                self.update_refresh_schedule(wake=True)
 
     def fail(self, message):
         self.paused = True
@@ -606,30 +717,28 @@ class GlassWindow(QWidget):
         self.timer.stop()
         self.failed.emit(message)
 
-    def set_locked(self, locked):
-        self.timer.stop(); self.drag_anchor = None
-        self.locked = locked
-        if locked:
-            self.transport_animation.stop(); self.animate_transport(0.)
-            self.transport.hide()
-        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, locked)
-        self.show()
-        self.reveal_transport(not locked and self.underMouse())
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+            self.settings_requested.emit()
+            return True
+        return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.settings_requested.emit()
+            event.accept()
+            return
         if self.transport.isVisible() and self.transport.geometry().contains(event.position().toPoint()):
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and not self.locked:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.drag_anchor = event.globalPosition().toPoint()
             self.drag_start = self.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.reveal_transport(False)
+            self.refresh()
 
     def mouseMoveEvent(self, event):
-        point = event.position()
-        self.view.light = QVector2D(point.x() / max(1, self.width()) * 2 - 1,
-                                    1 - point.y() / max(1, self.height()) * 2)
         if self.drag_anchor is not None:
             desired = self.drag_start + event.globalPosition().toPoint() - self.drag_anchor
             screen = QApplication.screenAt(event.globalPosition().toPoint()) or self.screen()
@@ -638,13 +747,17 @@ class GlassWindow(QWidget):
                       max(bounds.top(), min(desired.y(), bounds.bottom() - self.height() + 1)))
 
     def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.accept()
+            return
         self.drag_anchor = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.reveal_transport(self.underMouse())
+        self.refresh()
 
     def closeEvent(self, event):
         self.transport_animation.stop()
-        self.timer.stop(); self.view.shutdown(); self.capture.close()
+        self.timer.stop(); self.move_refresh.stop(); self.view.shutdown(); self.capture.close()
         super().closeEvent(event)
 
 
@@ -677,184 +790,21 @@ class Controls(SettingsWindow):
         self.last_frames, self.last_sample_time = 0, time.perf_counter()
         self.lyrics_message = "播放歌曲后自动匹配同步歌词"
         self.runtime_message = "拖动后方的网页或播放视频，可检验真实背景取样。"
-        layout = self.section("通用设置")
-        language_row = QHBoxLayout()
-        language_row.addWidget(QLabel("界面语言"))
-        self.language = QComboBox()
-        self.language.setAccessibleName("界面语言")
-        for code, label in LANGUAGES.items():
-            self.language.addItem(label, code)
-        self.language.setCurrentIndex(self.language.findData(settings["language"]))
-        self.language.currentIndexChanged.connect(self.language_changed)
-        language_row.addWidget(self.language); language_row.addStretch()
-        layout.addLayout(language_row)
-        layout = self.section("正在播放")
-        self.track_title = QLabel("等待 Apple Music")
-        self.track_title.setWordWrap(True)
-        self.track_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.track_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.track_title.setObjectName("trackTitle")
-        self.track_details = QLabel("打开 Apple Music 并播放一首歌曲")
-        self.track_details.setWordWrap(True); self.track_details.setTextFormat(Qt.TextFormat.PlainText)
-        self.track_details.setObjectName("trackDetails")
-        layout.addWidget(self.track_title); layout.addWidget(self.track_details)
-        media_row = QHBoxLayout()
-        self.media_status = QLabel("等待 Apple Music"); self.media_time = QLabel("0:00 / --:--")
-        media_row.addWidget(self.media_status); media_row.addStretch(); media_row.addWidget(self.media_time)
-        layout.addLayout(media_row)
-        self.media_progress = QProgressBar(); self.media_progress.setRange(0, 1000)
-        self.media_progress.setTextVisible(False); self.media_progress.setFixedHeight(6)
-        self.media_progress.setValue(0); self.media_progress.setAccessibleName("Apple Music 播放进度")
-        layout.addWidget(self.media_progress)
-        layout = self.section("歌词匹配")
-        lyric_row = QHBoxLayout()
-        lyric_row.addWidget(QLabel("曲目地区")); self.storefront = QComboBox()
-        for code, label in (("tr", "土耳其"), ("cn", "中国大陆"), ("hk", "香港"), ("tw", "台湾"), ("us", "美国")):
-            self.storefront.addItem(label, code)
-        self.storefront.setCurrentIndex(self.storefront.findData(settings["storefront"]))
-        self.storefront.setToolTip("仅用于跨地区曲名匹配，不会修改 Apple Music 账号地区。")
-        self.storefront.currentIndexChanged.connect(self.storefront_changed)
-        lyric_row.addWidget(self.storefront); lyric_row.addStretch()
-        self.retry_lyrics = QPushButton("重新匹配"); self.retry_lyrics.setEnabled(False)
-        self.retry_lyrics.clicked.connect(lambda: self.request_lyrics(force=True))
-        lyric_row.addWidget(self.retry_lyrics); layout.addLayout(lyric_row)
-        source_caption = QLabel("歌词源顺序 · 从左到右优先")
-        source_caption.setObjectName("secondary"); layout.addWidget(source_caption)
-        source_row = QHBoxLayout(); source_row.setSpacing(4)
-        self.source_choices = []
-        for position, source in enumerate(settings["lyric_source_order"]):
-            if position:
-                source_row.addWidget(QLabel("→"))
-            choice = QComboBox()
-            choice.setObjectName("sourceChoice")
-            choice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-            for key, label in LYRIC_SOURCES.items():
-                choice.addItem(label, key)
-            choice.setCurrentIndex(choice.findData(source))
-            choice.setAccessibleName(f"第 {position + 1} 优先歌词源")
-            choice.setToolTip("按从左到右的顺序自动匹配，未找到时继续尝试下一家。\n选择已有来源会交换位置，并重新匹配当前歌曲。")
-            choice.currentIndexChanged.connect(lambda index, slot=position: self.source_order_changed(slot))
-            self.source_choices.append(choice)
-            source_row.addWidget(choice)
-        layout.addLayout(source_row)
-        self.lyrics_status = QLabel("播放歌曲后自动匹配同步歌词")
-        self.lyrics_status.setWordWrap(True); layout.addWidget(self.lyrics_status)
-        cache_row = QHBoxLayout()
-        self.cache_status = QLabel("成功匹配的歌词会自动缓存，下次播放直接读取。")
-        self.cache_status.setObjectName("secondary"); self.cache_status.setWordWrap(True)
-        cache_row.addWidget(self.cache_status, 1)
-        self.clear_lyrics_cache = QPushButton("清空歌词缓存")
-        self.clear_lyrics_cache.setEnabled(media)
-        self.clear_lyrics_cache.setToolTip("清空本地歌词缓存，不影响正在显示的歌词。")
-        self.clear_lyrics_cache.clicked.connect(self.clear_cache)
-        cache_row.addWidget(self.clear_lyrics_cache); layout.addLayout(cache_row)
-        timing_caption = QHBoxLayout(); timing_caption.addWidget(QLabel("歌词校准")); timing_caption.addStretch()
-        timing_row = QHBoxLayout()
-        earlier = QPushButton("提前 0.1 秒"); later = QPushButton("延后 0.1 秒")
-        reset_timing = QPushButton("重置")
-        earlier.clicked.connect(lambda: self.change_lyric_offset(100))
-        later.clicked.connect(lambda: self.change_lyric_offset(-100))
-        reset_timing.clicked.connect(lambda: self.change_lyric_offset(DEFAULTS["lyric_offset_ms"] - self.settings["lyric_offset_ms"]))
-        self.lyric_timing = QLabel(); self.lyric_timing.setMinimumWidth(80)
-        self.lyric_timing.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lyric_timing.setText(self.offset_label())
-        self.lyric_timing.setToolTip("以标准时序为基准微调，重置恢复标准。\n只校准歌词，不改变歌曲播放进度。")
-        timing_caption.addWidget(self.lyric_timing); layout.addLayout(timing_caption)
-        for widget in (earlier, later, reset_timing): timing_row.addWidget(widget)
-        layout.addLayout(timing_row)
-        layout = self.section("玻璃外观")
-        description = QLabel(PRESETS["rich"]["description"])
-        description.setObjectName("secondary")
-        description.setWordWrap(True); layout.addWidget(description)
-        font_row = QHBoxLayout()
-        font_label = QLabel("歌词字体")
-        self.font_choice = QFontComboBox()
-        self.font_choice.setFontFilters(QFontComboBox.FontFilter.ScalableFonts)
-        self.font_choice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.font_choice.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.font_choice.setMinimumContentsLength(14)
-        self.font_choice.setAccessibleName("歌词字体")
-        self.font_choice.setToolTip("使用本机已安装的字体，选择后立即应用；缺字时自动使用系统备用字体。")
-        self.font_choice.setCurrentFont(QFont(settings["lyric_font"]))
-        self.font_choice.currentFontChanged.connect(self.font_changed)
-        font_label.setBuddy(self.font_choice)
-        font_row.addWidget(font_label); font_row.addWidget(self.font_choice, 1)
-        layout.addLayout(font_row)
-        grid = QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(14)
-        labels = dict(transparency_level="背景透明度", width="玻璃条宽度", height="玻璃条高度")
-        for row, (key, label) in enumerate(labels.items()):
-            slider = QSlider(Qt.Orientation.Horizontal)
-            # One width-slider unit is ten pixels, including dragging and wheel/key input.
-            step = 10 if key == "width" else 1
-            slider.setRange(*(number // step for number in LIMITS[key]))
-            if key == "width": slider.setPageStep(1)
-            slider.setValue(settings[key] // step)
-            slider.setAccessibleName(label)
-            value = QLabel(); value.setMinimumWidth(56); value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            caption = QLabel(label); caption.setBuddy(slider)
-            def change(number, field=key, readout=value, unit=step):
-                number *= unit
-                self.settings[field] = number
-                readout.setText(f"{number}{' px' if field in ('width', 'height') else ' / 10'}")
-                if field == "transparency_level":
-                    self.glass.view.set_transparency(number)
-                    self.set_transparency(number)
-                else:
-                    self.glass.resize(self.settings["width"], self.settings["height"])
-                self.glass.refresh()
-            slider.valueChanged.connect(change); change(slider.value())
-            self.sliders[key] = slider
-            grid.addWidget(caption, row, 0); grid.addWidget(slider, row, 1); grid.addWidget(value, row, 2)
-        layout.addLayout(grid)
-        self.sliders["transparency_level"].setToolTip("同步调节歌词条和设置面板：1 更浓，10 更通透，切换时柔和过渡。\n设置面板保留系统磨砂，文字与按钮不会一起变淡。")
-        layout.addWidget(QLabel("快捷位置"))
-        positions = QGridLayout()
-        self.position_buttons = []
-        for index, label in enumerate(("左上", "顶部居中", "右上", "左下", "底部居中", "右下")):
-            button = QPushButton(label)
-            button.clicked.connect(lambda checked=False, slot=index: self.place_lyrics(slot))
-            positions.addWidget(button, index // 3, index % 3)
-            self.position_buttons.append(button)
-        layout.addLayout(positions)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("刷新上限")); self.fps = QComboBox()
-        for value in FPS_OPTIONS: self.fps.addItem(f"{value} FPS", value)
-        self.fps.setCurrentIndex(self.fps.findData(settings["fps"]))
-        self.fps.setToolTip("刷新上限不代表实际帧率，实际表现取决于桌面取样速度与设备性能。")
-        self.fps.currentIndexChanged.connect(self.fps_changed); row.addWidget(self.fps)
-        row.addStretch(); self.pause = QPushButton("暂停刷新"); self.pause.clicked.connect(self.toggle_pause); row.addWidget(self.pause)
-        layout.addLayout(row)
-        self.lock = QCheckBox("锁定悬浮条，允许鼠标穿透（在这里解锁）")
-        self.lock.toggled.connect(self.glass.set_locked); layout.addWidget(self.lock)
-        help_text = QLabel("按住歌词条可拖动；锁定后鼠标可穿透。透明度同时作用于歌词条和设置面板。")
-        help_text.setObjectName("secondary"); help_text.setWordWrap(True); layout.addWidget(help_text)
-        layout = self.section("运行状态")
-        self.version_label = QLabel(); layout.addWidget(self.version_label)
-        self.stats = QLabel("正在测量 CPU、内存与实际帧率…"); self.stats.setWordWrap(True); layout.addWidget(self.stats)
-        self.timing = QLabel(); self.timing.setWordWrap(True); layout.addWidget(self.timing)
-        self.hardware = QLabel("正在识别显卡…"); self.hardware.setWordWrap(True); layout.addWidget(self.hardware)
-        footer = QLabel("桌面画面仅在本机处理，不保存、不上传。\n歌词匹配会向曲目和歌词服务查询歌名、歌手与时长。\nCPU 为整机归一化占比；GPU 显示材质绘制耗时。")
-        footer.setWordWrap(True); footer.setObjectName("secondary"); layout.addWidget(footer)
-        self.status = QLabel("拖动后方的网页或播放视频，可检验真实背景取样。")
-        self.status.setWordWrap(True); layout.addWidget(self.status)
-        self.sample_timer = QTimer(self); self.sample_timer.timeout.connect(self.sample); self.sample_timer.start(1000)
+        build_settings(self, settings, media)
+        self.sample_timer = QTimer(self)
+        self.sample_timer.timeout.connect(lambda: self.sample(render=self.isVisible()))
+        self.sample_timer.start(1000)
         screen = QApplication.primaryScreen().availableGeometry()
         self.glass.move(screen.center().x() - settings["width"] // 2, screen.top() + 160)
-        self.apply_material(settings["preset"])
-        self.resize(min(610, screen.width() - 60), min(980, screen.height() - 80))
+        self.resize(min(624, screen.width() - 60), min(992, screen.height() - 80))
         self.move(screen.left() + 40, max(screen.top() + 20, screen.bottom() - self.height() - 30))
-        self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray.setToolTip("MoonLyrics · 月光歌词")
-        self.tray_menu = QMenu(self)
-        self.tray_menu.addAction("打开设置", self.restore_settings)
-        self.tray_menu.addSeparator()
-        self.tray_menu.addAction("退出 MoonLyrics", self.close)
-        self.tray.setContextMenu(self.tray_menu)
-        self.tray.activated.connect(self.tray_activated)
-        self.tray.show()
-        self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.update_playback_display)
+        self.glass.settings_requested.connect(self.restore_settings)
+        self.media_timer = QTimer(self); self.media_timer.timeout.connect(self.advance_display)
         self.media_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.media_timer.start(33)
+        self.next_settings_refresh = 0.
+        self.attach_glass(GlassView, settings, self.glass.capture)
+        self.glass.view.tone_changed.connect(self.sync_appearance)
+        self.sync_appearance()
         self.prepare_translations()
         self.retranslate_ui()
         if media:
@@ -867,13 +817,14 @@ class Controls(SettingsWindow):
             self.media_reader.command_finished.connect(self.media_command_finished)
             self.media_reader.start()
 
-    def ui_text(self, source, **values):
-        return translate(self.settings["language"], source, **values)
+    def ui_text(self, text, **values):
+        return translate(self.settings["language"], text, **values)
 
     def prepare_translations(self):
         # Bind only static UI text; never translate song titles or replace live status with initial text.
         dynamic = (self.track_title, self.track_details, self.media_status, self.lyrics_status,
-                   self.lyric_timing, self.stats, self.timing, self.hardware, self.status, self.pause, self.cache_status)
+                   self.lyric_timing, self.stats, self.timing, self.hardware, self.status, self.pause, self.cache_status,
+                   self.material_description,self.appearance_caption,self.reserve_source,self.position_label,self.runtime_summary)
         self.text_bindings = []
         objects = [self, self.glass] + self.findChildren(QWidget) + self.findChildren(QAction)
         for obj in objects:
@@ -894,22 +845,48 @@ class Controls(SettingsWindow):
         self.glass.view.lyric_image_key = None
         self.glass.view.update()
 
+    def appearance_changed(self):
+        self.settings["appearance_mode"] = self.appearance.currentData()
+        for mode, button in self.appearance_buttons.items():
+            button.setChecked(mode == self.settings["appearance_mode"])
+        self.glass.view.update_appearance()
+        self.sync_appearance()
+
+    def sync_appearance(self):
+        if self.settings_backdrop:
+            self.settings_backdrop.view.set_night(self.glass.view.night)
+        if self.night != self.glass.view.night or not self.styleSheet():
+            self.apply_appearance(self.glass.view.night)
+        if hasattr(self,'appearance_caption'):
+            mode='夜间' if self.night else '日间'
+            text='系统当前为{mode}' if self.settings['appearance_mode']=='system' else '歌词条与设置面板使用{mode}外观'
+            self.appearance_caption.setText(self.ui_text(text,mode=self.ui_text(mode)))
+            self.update_ui_icons()
+
     def retranslate_ui(self):
         for setter, source in self.text_bindings:
             setter(self.ui_text(source))
-        for combo in [self.storefront] + self.source_choices:
+        self.material_description.setText(self.ui_text(PRESETS["rich"]["description"]))
+        for mode, button in self.appearance_buttons.items():
+            button.setText(self.ui_text(SHORT_MODES[mode]))
+        group=self.appearance_buttons['day'].parentWidget()
+        group.setFixedWidth(max(252,sum(button.sizeHint().width() for button in self.appearance_buttons.values())+16))
+        choices = [(self.storefront, dict(tr="土耳其", cn="中国大陆", hk="香港", tw="台湾", us="美国")),
+                   (self.appearance, APPEARANCE_MODES)]
+        choices += [(choice, LYRIC_SOURCES) for choice in self.source_choices]
+        for combo, labels in choices:
             blocked = combo.blockSignals(True)
             for index in range(combo.count()):
                 key = combo.itemData(index)
-                source = (dict(tr="土耳其", cn="中国大陆", hk="香港", tw="台湾", us="美国")[key]
-                          if combo is self.storefront else LYRIC_SOURCES[key])
-                combo.setItemText(index, self.ui_text(source))
+                combo.setItemText(index, self.ui_text(labels[key]))
             combo.blockSignals(blocked)
         for position, choice in enumerate(self.source_choices):
             choice.setAccessibleName(self.ui_text("第 {position} 优先歌词源", position=position + 1))
-        self.version_label.setText(self.ui_text("版本：{version}", version=__version__))
+        self.version_label.setText(__version__)
+        self.version_label.setToolTip(self.ui_text("版本：{version}",version=__version__))
+        self.update_reserve_source()
+        self.sync_appearance()
         self.cache_status.setText(self.ui_text(getattr(self, "cache_message", "成功匹配的歌词会自动缓存，下次播放直接读取。")))
-        self.tray.setToolTip(self.ui_text("MoonLyrics · 月光歌词"))
         self.lyric_timing.setText(self.offset_label())
         self.set_lyrics_status(self.lyrics_message)
         document = self.glass.view.lyrics
@@ -934,6 +911,12 @@ class Controls(SettingsWindow):
             button.setEnabled(bool(self.media_reader) and not self.closing and not self.media_command_busy
                               and action in self.playback.controls)
             button.setIcon(self.glass.media_icons[("pause" if playing else "play") if action == "toggle" else action])
+            if hasattr(self, "settings_media_buttons"):
+                other = self.settings_media_buttons[action]
+                other.setAccessibleName(button.accessibleName()); other.setToolTip(button.toolTip())
+                other.setEnabled(button.isEnabled())
+                name=("pause" if playing else "play") if action=="toggle" else ("skip-back" if action=="previous" else "skip-forward")
+                other.setIcon(settings_icon(name,'#1d1d1f' if self.glass.view.dark_text else '#f5f5f7'))
 
     def send_media_command(self, action):
         if self.closing or self.media_command_busy or action not in self.playback.controls:
@@ -959,10 +942,12 @@ class Controls(SettingsWindow):
         self.track_title.setText(self.playback.title or self.ui_text("等待 Apple Music"))
         self.track_details.setText(" · ".join(value for value in (self.playback.artist, self.playback.album) if value)
                                    or self.ui_text("打开 Apple Music 并播放一首歌曲"))
+        self.track_title.setToolTip(self.track_title.text());self.track_details.setToolTip(self.track_details.text())
 
     def set_lyrics_status(self, message):
         self.lyrics_message = message
         self.lyrics_status.setText(translate_message(self.settings["language"], message))
+        self.lyrics_status.setToolTip(self.lyrics_status.text())
 
     def clear_cache(self):
         if self.lyrics_worker is None:
@@ -996,27 +981,31 @@ class Controls(SettingsWindow):
         y = (margin_y, space_y - margin_y)[position // 3]
         self.glass.move(bounds.left() + x, bounds.top() + y)
         self.glass.ensure_topmost(force=True)
+        for slot,button in enumerate(self.position_buttons):button.setChecked(slot==position)
+        self.position_label.setText(self.ui_text('屏幕{position}',position=self.ui_text(POSITION_LABELS[position])))
+        self.update_ui_icons()
 
     def minimize_settings(self):
-        if QSystemTrayIcon.isSystemTrayAvailable():
+        if not self.closing:
             self.hide()
-        else:
-            super().minimize_settings()
+
+    def finish_minimize(self):
+        # A queued minimize must not hide Settings after a restore request.
+        if not self.closing and self.isMinimized():
+            self.hide()
 
     def restore_settings(self):
         if not self.closing:
             self.showNormal(); self.raise_(); self.activateWindow()
+            self.update_playback_display()
+            self.render_stats()
             self.glass.ensure_topmost(force=True)
-
-    def tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
-            self.restore_settings()
 
     def changeEvent(self, event):
         super().changeEvent(event)
         if (event.type() == QEvent.Type.WindowStateChange and self.isMinimized()
-                and getattr(self, "tray", None) and QSystemTrayIcon.isSystemTrayAvailable()):
-            QTimer.singleShot(0, self.hide)
+                and hasattr(self, "glass")):
+            QTimer.singleShot(0, self.finish_minimize)
 
     def set_playback(self, snapshot):
         if self.closing:
@@ -1026,6 +1015,10 @@ class Controls(SettingsWindow):
             if self.glass.retry_delay:
                 self.glass.refresh()
         self.playback = snapshot
+        was_active = self.glass.playback_active
+        self.glass.playback_active = snapshot.status == "playing"
+        self.glass.update_refresh_schedule(wake=self.glass.playback_active and not was_active)
+        self.update_animation_schedule()
         self.render_media_controls()
         self.lyric_clock.update(snapshot)
         self.update_track_labels()
@@ -1033,7 +1026,7 @@ class Controls(SettingsWindow):
         if (self.matching_key(snapshot) != self.lyric_key
                 or snapshot.duration > 0 and abs(snapshot.duration - self.lyric_duration) > 1.):
             self.request_lyrics(defer=True)
-        self.update_playback_display()
+        self.update_playback_display(update_settings=self.isVisible())
 
     def storefront_changed(self):
         self.settings["storefront"] = self.storefront.currentData()
@@ -1042,14 +1035,22 @@ class Controls(SettingsWindow):
     def source_order_changed(self, position):
         order = list(self.settings["lyric_source_order"])
         selected = self.source_choices[position].currentData()
-        previous = order.index(selected)
-        order[previous], order[position] = order[position], selected
+        if selected in order:
+            previous = order.index(selected)
+            order[previous], order[position] = order[position], selected
+        else:
+            order[position] = selected
         self.settings["lyric_source_order"] = tuple(order)
         for choice, source in zip(self.source_choices, order):
             blocked = choice.blockSignals(True)
             choice.setCurrentIndex(choice.findData(source))
             choice.blockSignals(blocked)
+        self.update_reserve_source()
         self.request_lyrics(force=True)
+
+    def update_reserve_source(self):
+        reserved=[name for key,name in LYRIC_SOURCES.items() if key not in self.settings['lyric_source_order']]
+        self.reserve_source.setText(self.ui_text('{source} 备用',source=' / '.join(self.ui_text(name) for name in reserved)))
 
     def matching_key(self, snapshot):
         text = lambda value: " ".join(value.split()).casefold()
@@ -1099,16 +1100,34 @@ class Controls(SettingsWindow):
         self.lyric_timing.setText(self.offset_label())
         self.update_playback_display()
 
-    def update_playback_display(self):
+    def update_animation_schedule(self):
+        if self.playback.status != "playing":
+            self.media_timer.stop()
+            return
+        interval = max(33, round(1000/self.settings["fps"]))
+        if not self.media_timer.isActive() or self.media_timer.interval() != interval:
+            self.media_timer.start(interval)
+
+    def advance_display(self):
+        now = time.monotonic()
+        update_settings = self.isVisible() and now >= self.next_settings_refresh
+        if update_settings:
+            self.next_settings_refresh = now+.1
+        self.update_playback_display(update_settings=update_settings)
+
+    def update_playback_display(self, *, update_settings=True):
         snapshot = self.playback
-        position = snapshot.position_at()
-        state = self.ui_text(STATUS_LABELS.get(snapshot.status, "等待播放"))
-        timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
-        self.media_status.setText(state); self.media_time.setText(timing)
-        self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
         offset = lyric_offset_seconds(self.settings)
         self.glass.view.set_lyric_time(self.lyric_clock.position_at() + offset,
                                       snapshot.duration + offset if snapshot.duration > 0 else None)
+        if not update_settings and self.glass.view.lyrics is not None:
+            return
+        position = snapshot.position_at()
+        state = self.ui_text(STATUS_LABELS.get(snapshot.status, "等待播放"))
+        timing = format_time(position) + " / " + (format_time(snapshot.duration) if snapshot.duration else "--:--")
+        if update_settings:
+            self.media_status.setText(state); self.media_time.setText(timing)
+            self.media_progress.setValue(round(position / snapshot.duration * 1000) if snapshot.duration else 0)
         primary = " — ".join(value for value in (snapshot.title, snapshot.artist) if value) or state
         secondary = timing + " · " + self.lyrics_status.text() if snapshot.title else self.ui_text("播放音乐后显示歌曲与进度")
         if (primary, secondary) != (self.glass.view.primary_text, self.glass.view.secondary_text):
@@ -1117,8 +1136,8 @@ class Controls(SettingsWindow):
 
     def fps_changed(self):
         self.settings["fps"] = self.fps.currentData()
-        if not self.glass.paused and not self.glass.retry_delay:
-            self.glass.timer.start(round(1000 / self.settings["fps"]))
+        self.glass.update_refresh_schedule(wake=True)
+        self.update_animation_schedule()
 
     def toggle_pause(self):
         self.glass.paused = not self.glass.paused
@@ -1144,8 +1163,10 @@ class Controls(SettingsWindow):
         self.status.style().unpolish(self.status); self.status.style().polish(self.status)
         self.pause.setText(self.ui_text("重试刷新"))
 
-    def sample(self):
+    def sample(self, *, render=True):
         self.glass.ensure_topmost()
+        self.glass.view.update_appearance()
+        self.sync_appearance()
         cpu, memory = self.usage.read()
         now = time.perf_counter(); view = self.glass.view
         fps = (view.frames - self.last_frames) / max(.01, now - self.last_sample_time)
@@ -1153,7 +1174,8 @@ class Controls(SettingsWindow):
         sample = dict(cpu=cpu, memory_mb=memory, fps=fps, capture_ms=view.capture_ms, gpu_ms=view.gpu_ms)
         self.samples.append(sample)
         self.samples = self.samples[-120:]
-        self.render_stats()
+        if render:
+            self.render_stats()
 
     def render_stats(self):
         view = self.glass.view
@@ -1162,6 +1184,7 @@ class Controls(SettingsWindow):
             self.hardware.setText(self.ui_text("正在识别显卡…"))
             return
         sample = self.samples[-1]
+        self.runtime_summary.setText('CPU {cpu:.1f}% · {memory_mb:.0f} MB · {fps:.0f} FPS'.format(**sample))
         self.stats.setText(self.ui_text("CPU  {cpu:.2f}%     内存  {memory_mb:.1f} MB     实际帧率  {fps:.1f} FPS", **sample))
         gpu = "—" if view.gpu_ms is None else f"{view.gpu_ms:.2f} ms"
         self.timing.setText(self.ui_text("桌面取样  {capture_ms:.2f} ms / 帧     GPU 材质绘制  {gpu}", capture_ms=view.capture_ms, gpu=gpu))
@@ -1180,7 +1203,6 @@ class Controls(SettingsWindow):
             return
         self.media_timer.stop()
         self.sample_timer.stop()
-        self.tray.hide()
         self.glass.close()
         if self.save_enabled:
             try:
@@ -1197,7 +1219,7 @@ def self_test(app, control, report_path, preview_path):
     from unittest.mock import Mock, patch
     from PyQt6.QtTest import QTest
     from PyQt6.QtGui import QFontDatabase, QFontInfo, QImage
-    from PIL import Image, ImageChops, ImageFilter, ImageGrab, ImageStat
+    from PIL import Image, ImageChops, ImageGrab, ImageStat
     from .windows_capture import client_origin
 
     class Calibration(QWidget):
@@ -1233,10 +1255,7 @@ def self_test(app, control, report_path, preview_path):
     def parameters(**values):
         for key, number in values.items():
             if key == "fps": control.fps.setCurrentIndex(control.fps.findData(number))
-            elif key == "preset":
-                material = PRESETS[number]
-                control.settings.update(preset=number, blur=material["blur"], refraction=material["refraction"])
-            elif key in ("blur", "refraction"): control.settings[key] = number
+            elif key == "appearance_mode": control.appearance.setCurrentIndex(control.appearance.findData(number))
             else: control.sliders[key].setValue(number // (10 if key == "width" else 1))
         control.glass.refresh(); QTest.qWait(300)
         assert control.error is None, control.error
@@ -1259,30 +1278,29 @@ def self_test(app, control, report_path, preview_path):
         assert default_font.family() == "Noto Sans SC Black" and default_font.weight() == QFont.Weight.Black
         assert "SIL OPEN FONT LICENSE" in (Path(__file__).resolve().parents[1] / "assets" / "NotoSansSC-OFL.txt").read_text(encoding="utf-8")
         result["bundled_default_font"] = dict(family=default_font.family(), weight=default_font.weight(), license_included=True)
-        assert control.sliders["transparency_level"].minimum() == 1
-        assert control.sliders["transparency_level"].maximum() == 10
-        assert "blur" not in control.sliders and "refraction" not in control.sliders
-        assert normalized(dict(transparency_level=0))["transparency_level"] == 1
-        assert normalized(dict(transparency_level=11))["transparency_level"] == 10
-        assert normalized(dict(transparency=90))["transparency_level"] == 1
-        assert normalized(dict(transparency=100))["transparency_level"] == 10
-        assert normalized(dict(transparency_level=4, transparency=90))["transparency_level"] == 4
-        assert transparency_amount(1) == .9 and transparency_amount(10) == 1.
-        for name, preset in PRESETS.items():
-            restored = normalized(dict(preset=name, blur=100, refraction=100, width=640, transparency=96))
-            assert restored["preset"] == name and restored["blur"] == preset["blur"] and restored["refraction"] == preset["refraction"]
-            assert normalized(json.loads(json.dumps(restored))) == restored
-        assert normalized(dict(preset=[]))["preset"] == DEFAULTS["preset"]
-        result["preset_settings_and_transparency_bounds"] = True
+        assert [control.appearance.itemData(i) for i in range(control.appearance.count())] == list(APPEARANCE_MODES)
+        assert set(control.sliders) == {"width", "height"}
+        migrated = normalized(dict(transparency_level=47, transparency_scale=100, width=640, lyric_font="Segoe UI"))
+        assert migrated["appearance_mode"] == "system" and migrated["width"] == 640 and migrated["lyric_font"] == "Segoe UI"
+        assert "transparency_level" not in migrated
+        for mode in APPEARANCE_MODES:
+            restored = normalized(dict(appearance_mode=mode))
+            assert restored["appearance_mode"] == mode and normalized(json.loads(json.dumps(restored))) == restored
+        assert normalized(dict(appearance_mode=[]))["appearance_mode"] == "system"
+        assert "MIT License" in (Path(__file__).resolve().parents[1] / "assets" / "Glasswork-LICENSE.txt").read_text(encoding="utf-8")
+        assert "MIT License" in (Path(__file__).resolve().parents[1] / "assets" / "Atrium-LICENSE.txt").read_text(encoding="utf-8")
+        result["appearance_modes"] = dict(choices=list(APPEARANCE_MODES), default="system", legacy_settings_migrated=True,
+                                          glasswork_license_included=True, atrium_license_included=True)
         assert glass.view.ready, "GPU renderer did not initialize"
         assert not control.error, control.error
         glass.view.show_text = False
-        parameters(blur=15, refraction=24, transparency_level=1)
+        parameters(appearance_mode="day")
         glass.timer.stop(); glass.hide(); QTest.qWait(120)
         geometry = glass.view.frame_geometry
         sampled_frame(geometry[2])
         baseline = C.string_at(glass.capture.bits, math.prod(glass.capture.size) * 4)
-        raw_image = Image.frombytes("RGB", glass.capture.size, baseline, "raw", "BGRX", 0, -1)
+        raw_image = Image.frombytes("RGB", glass.capture.size, baseline, "raw", "BGRX", 0,
+                                    1 if glass.capture.top_down else -1)
         colors = sorted(raw_image.getcolors(raw_image.width * raw_image.height), reverse=True)
         result["calibration_dominant_colors"] = colors[:2]
         assert all(color in [(41, 126, 187), (242, 192, 112)] for _, color in colors[:2]), "Calibration window is obscured"
@@ -1330,92 +1348,74 @@ def self_test(app, control, report_path, preview_path):
                                             retained_texture=True, fresh_background=True, exclusion_preserved=True)
         glass.timer.stop()
         calibration.pattern = "checker"; calibration.update(); QTest.qWait(100)
-        parameters(blur=0, refraction=0); sharp = image()
-        fw, fh, pad = glass.view.frame_geometry
-        raw_frame = Image.frombytes("RGB", glass.capture.size,
-                                    C.string_at(glass.capture.bits, math.prod(glass.capture.size) * 4),
-                                    "raw", "BGRX", 0, -1).crop((pad, pad, pad + fw, pad + fh))
-        expected = Image.merge("RGB", [channel.point(lambda v, t=tint: round(v * .9 + t * 255 * .1))
-                                      for channel, tint in zip(raw_frame.split(), (.10, .16, .22))])
-        center_crop = (20, round(fh * .35), fw - 20, round(fh * .65))
-        alignment_error = sum(ImageStat.Stat(ImageChops.difference(sharp, expected).crop(center_crop)).mean) / 3
-        result["zero_effect_alignment_mean_error"] = alignment_error
-        assert alignment_error < 4, f"Background sampling alignment/orientation failed: {alignment_error}"
-        parameters(blur=100, refraction=0); blurred = image()
-        parameters(blur=0, refraction=100); refracted = image()
-        crop = (10, 10, sharp.width - 10, sharp.height - 10)
-        def energy(im):
-            return sum(ImageStat.Stat(im.filter(ImageFilter.FIND_EDGES).crop(crop)).mean)
-        result["blur_edge_energy_ratio"] = energy(blurred) / energy(sharp)
-        result["refraction_mean_pixel_difference"] = sum(ImageStat.Stat(ImageChops.difference(sharp, refracted)).mean) / 3
-        assert result["blur_edge_energy_ratio"] < .35, result
-        assert result["refraction_mean_pixel_difference"] > .5, result
-        parameters(preset="rich")
-        assert control.settings["blur"] == 38 and control.settings["refraction"] == 2
-        result["fixed_rich_material"] = True
-        # Fine stripes expose sparse-kernel aliasing and nearest-filter blocks that a coarse checker misses.
-        result["frost_stripe_checks"] = []
-        for direction in ("vertical", "horizontal"):
-            calibration.pattern = direction
-            for period in (2, 3, 4, 6, 8):
-                calibration.period = period; calibration.update(); QTest.qWait(50)
-                for name in PRESETS:
-                    parameters(preset=name)
-                    actual = image()
-                    cw, ch = glass.capture.size
-                    fw, fh, pad = glass.view.frame_geometry
-                    raw = Image.frombytes("RGB", (cw, ch),
-                                          C.string_at(glass.capture.bits, cw * ch * 4), "raw", "BGRX", 0, -1)
-                    reference = raw.filter(ImageFilter.GaussianBlur(PRESETS[name]["blur"] * .24 * glass.devicePixelRatioF()))
-                    reference = reference.crop((pad, pad, pad + fw, pad + fh))
-                    reference = Image.merge("RGB", [channel.point(lambda v, t=tint: round(v * .9 + t * 255 * .1))
-                                                     for channel, tint in zip(reference.split(), (.10, .16, .22))])
-                    center = (round(fw * .2), round(fh * .35), round(fw * .8), round(fh * .65))
-                    error = sum(ImageStat.Stat(ImageChops.difference(actual, reference).crop(center)).mean) / 3
-                    variation = max(ImageStat.Stat(actual.crop(center)).stddev)
-                    result["frost_stripe_checks"].append(dict(direction=direction, period=period, preset=name,
-                                                            reference_error=error, variation=variation))
-                    assert error < 2 and variation < 1.5, result["frost_stripe_checks"][-1]
-        calibration.pattern = "checker"; calibration.update(); QTest.qWait(80)
-        # The animation must also repaint when desktop refresh is paused, and retarget without jumping.
-        glass.timer.stop()
-        samples = []
-        glass.view.transparency_animation.valueChanged.connect(lambda value: samples.append(float(value)))
-        before_frames = glass.view.frames
-        control.sliders["transparency_level"].setValue(10)
-        QTest.qWait(70)
-        mid = glass.view.transparency
-        assert .9 < mid < 1. and glass.view.frames > before_frames
-        QTest.qWait(230)
-        assert abs(glass.view.transparency - 1.) < 1e-8
-        assert len(set(samples)) >= 4 and all(b >= a for a, b in zip(samples, samples[1:]))
-        assert not glass.timer.isActive()
-        control.sliders["transparency_level"].setValue(1); QTest.qWait(60)
-        prior = glass.view.transparency
-        control.sliders["transparency_level"].setValue(5)
-        assert abs(glass.view.transparency - prior) < 1e-8
-        QTest.qWait(300)
-        assert abs(glass.view.transparency - transparency_amount(5)) < 1e-8
-        result["transparency_smooth_transition"] = dict(intermediate=mid, distinct_values=len(set(samples)),
-                                                       paused_refresh=True, continuous_retarget=True)
-        # Match input/output at blur=0 so flips, incorrect coordinates and stale textures cannot pass.
-        parameters(blur=0, refraction=0, transparency_level=10)
-        transparent = glass.view.grabFramebuffer()
-        assert transparent.pixelColor(transparent.width() // 2, transparent.height() // 2).alpha() == 0
-        result["transparent_background_alpha"] = 0
+        parameters(appearance_mode="day"); day = image()
+        parameters(appearance_mode="night"); night = image()
+        center = (round(day.width*.2), round(day.height*.35), round(day.width*.8), round(day.height*.65))
+        difference = sum(ImageStat.Stat(ImageChops.difference(day, night).crop(center)).mean)/3
+        assert difference > 15, difference
+        assert glass.view.blur_key == 2*glass.view.devicePixelRatioF()
+        assert glass.view.lens_fbo.isValid() and glass.view.lens_size == (glass.width(), glass.height())
+        result["glasswork_material"] = dict(day_night_difference=difference, blur_css_px=2, cached_rim_lens=True)
+        # Changing appearance must repaint retained pixels without resuming paused capture.
+        control.toggle_pause(); assert glass.paused and not glass.timer.isActive()
+        before = glass.view.frames
+        control.appearance.setCurrentIndex(control.appearance.findData("day")); QTest.qWait(100)
+        assert glass.view.dark_text and glass.view.frames > before and glass.paused and not glass.timer.isActive()
+        with patch("moonlyrics.windows.system_is_dark", return_value=True):
+            control.appearance.setCurrentIndex(control.appearance.findData("system")); control.sample()
+            assert glass.view.night
+            control.appearance.setCurrentIndex(control.appearance.findData("day")); control.sample()
+            assert not glass.view.night
+        with patch("moonlyrics.windows.system_is_dark", return_value=False):
+            control.appearance.setCurrentIndex(control.appearance.findData("system")); control.sample()
+            assert not glass.view.night
+            control.appearance.setCurrentIndex(control.appearance.findData("night")); control.sample()
+            assert glass.view.night
+        result["appearance_modes"].update(paused_refresh_switch=True, system_theme_follow=True, explicit_override=True)
+        control.toggle_pause(); assert not glass.paused
+        parameters(appearance_mode="day")
+        clear_frame = glass.view.grabFramebuffer()
+        assert clear_frame.pixelColor(clear_frame.width()//2, clear_frame.height()//2).alpha() == 255
+        result["background_alpha"] = 255
         glass.view.show_text = True
         result["profiles"] = {}
-        for name, values in (("rich_30fps", dict(preset="rich", transparency_level=1, fps=30)),
-                             ("maximum_60fps", dict(blur=100, refraction=100, transparency_level=1, fps=60))):
+        for name, values in (("day_30fps", dict(appearance_mode="day", fps=30)),
+                             ("night_30fps", dict(appearance_mode="night", fps=30))):
             parameters(**values); glass.timer.start(round(1000 / values["fps"]))
             QTest.qWait(1200); control.samples.clear()
             for _ in range(7): QTest.qWait(1000)
             samples = list(control.samples)
             result["profiles"][name] = {key: statistics.mean(s[key] for s in samples if s[key] is not None)
                                         for key in samples[0] if any(s[key] is not None for s in samples)}
-        parameters(preset="rich", transparency_level=1, width=580, height=80, fps=30)
+        parameters(appearance_mode="day", width=580, height=80, fps=30)
+        location = glass.pos()
+        QTest.mousePress(glass, Qt.MouseButton.LeftButton, pos=QPoint(80, 40))
+        glass.timer.stop(); QTest.qWait(80)
+        origin_fn = api(user32, "ClientToScreen", W.BOOL, W.HWND, C.POINTER(W.POINT))
+        tracked, before_frames = 0, glass.view.frames
+        held_dark_text = glass.view.dark_text
+        with patch.object(glass.view.gl, "glTexSubImage2D", wraps=glass.view.gl.glTexSubImage2D) as upload, \
+                patch.object(glass.view.gl, "glTexImage2D", wraps=glass.view.gl.glTexImage2D) as allocate, \
+                patch.object(glass.view, "draw", wraps=glass.view.draw) as draw:
+            for step in range(30):
+                glass.move(location + QPoint(step*4, 0)); QTest.qWait(12)
+                origin = W.POINT(); assert origin_fn(int(glass.winId()), C.byref(origin))
+                pad = glass.view.frame_geometry[2]
+                key = glass.capture.frame_key
+                tracked += bool(key and key[1:3] == (origin.x-pad, origin.y-pad))
+        gpu_uploads = upload.call_count+allocate.call_count
+        blur_passes = sum(call.args[0] is glass.view.blur_program for call in draw.call_args_list)
+        assert tracked >= 20 and glass.view.frames-before_frames >= 10, (tracked, glass.view.frames-before_frames)
+        assert gpu_uploads <= 3 and blur_passes <= 6, (gpu_uploads, blur_passes)
+        assert glass.view.dark_text == held_dark_text
+        result["drag_background_tracking"] = dict(current_position_crops=tracked, steps=30,
+                                                   rendered_frames=glass.view.frames-before_frames,
+                                                   gpu_uploads=gpu_uploads, blur_passes=blur_passes, stable_appearance=True)
+        QTest.mouseRelease(glass, Qt.MouseButton.LeftButton, pos=QPoint(80, 40))
+        glass.move(location); QTest.qWait(80)
         control.set_playback(PlaybackSnapshot(title="月光轻轻落在窗台", artist="MoonLyrics",
                                              album="播放信息测试", status="paused", position=64., duration=270.))
+        control.update_playback_display()  # Hidden settings refresh only when explicitly requested.
         assert control.media_time.text() == "1:04 / 4:30"
         assert control.media_status.text() == "已暂停"
         assert control.media_progress.value() == round(64 / 270 * 1000)
@@ -1424,7 +1424,8 @@ def self_test(app, control, report_path, preview_path):
         original_order = control.settings["lyric_source_order"]
         control.source_choices[0].setCurrentIndex(control.source_choices[0].findData("qq"))
         assert control.settings["lyric_source_order"][0] == "qq"
-        assert len(set(choice.currentData() for choice in control.source_choices)) == len(LYRIC_SOURCES)
+        assert len(set(choice.currentData() for choice in control.source_choices)) == 3
+        assert all(choice.count() == len(LYRIC_SOURCES) for choice in control.source_choices)
         assert normalized(json.loads(json.dumps(control.settings)))["lyric_source_order"] == control.settings["lyric_source_order"]
         for choice, source in zip(control.source_choices, original_order):
             choice.setCurrentIndex(choice.findData(source))
@@ -1514,7 +1515,6 @@ def self_test(app, control, report_path, preview_path):
                                           long_line_pan=True, seek_resets_pan=True)
         # Desktop sampling was verified above; keep it out of settings animation timing checks.
         glass.timer.stop()
-        from .settings_ui import MATERIALS
         assert not app.windowIcon().isNull() and not control.windowIcon().isNull()
         control.move(screen.right() - control.width() - 30, screen.top() + 30)
         control.show(); QTest.qWait(200)
@@ -1526,56 +1526,98 @@ def self_test(app, control, report_path, preview_path):
         QTest.qWait(100); assert control.isMaximized()
         QTest.mouseDClick(control.title_bar, Qt.MouseButton.LeftButton, pos=QPoint(250, 25))
         QTest.qWait(100); assert not control.isMaximized()
-        assert control.settings["preset"] == "rich" and control.material == MATERIALS["rich"]
-        assert not any(button.text() in ("清透", "柔光", "凝润") for button in control.findChildren(QPushButton))
-        if control.backdrop_active:
-            frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
-            for x, y in ((5, 5), (control.width()-6, 5), (5, control.height()-6),
-                         (control.width()-6, control.height()-6)):
-                assert frame.pixelColor(round(x*ratio), round(y*ratio)).alpha() >= MATERIALS["rich"][3] - 3, "Native corners expose untinted Acrylic"
-        control.sliders["transparency_level"].setValue(10); QTest.qWait(80)
-        assert 1 < control.transparency_level < 10
-        QTest.qWait(230)
-        assert control.transparency_level == control.settings["transparency_level"] == 10
-        assert abs(glass.view.transparency - 1) < .0001 and control.windowOpacity() == 1
-        if control.backdrop_active:
-            frame = control.grab().toImage(); ratio = frame.devicePixelRatio()
-            assert frame.pixelColor(round(15*ratio), round(200*ratio)).alpha() < MATERIALS["rich"][3] // 2
-        control.sliders["transparency_level"].setValue(1); QTest.qWait(280)
-        tray_available = QSystemTrayIcon.isSystemTrayAvailable()
-        if tray_available:
-            assert control.tray.isVisible()
-            control.minimize_settings(); QTest.qWait(50)
-            assert not control.isVisible() and glass.isVisible()
-            control.tray_activated(QSystemTrayIcon.ActivationReason.Trigger); QTest.qWait(100)
-            assert control.isVisible() and not control.isMinimized()
-            control.showMinimized(); QTest.qWait(100)
-            assert not control.isVisible() and control.tray.isVisible()
-            control.tray_menu.actions()[0].trigger(); QTest.qWait(100)
-            assert control.isVisible() and not control.isMinimized()
-        with patch("moonlyrics.windows.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
-            control.minimize_settings(); QTest.qWait(100)
-            assert control.isVisible() and control.isMinimized()
+        settings_backdrop = control.settings_backdrop
+        deadline = time.perf_counter()+3
+        while not control.backdrop_active and time.perf_counter()<deadline:
+            QTest.qWait(50)
+        assert control.backdrop_active and settings_backdrop.view.ready, "Shared settings glass did not initialize"
+        # Check the actual screen before any widget/FBO grab. GPU readback
+        # alone can pass even when the native window omits the glass layer.
+        calibration.hide()
+        screen_backdrop=QWidget()
+        screen_backdrop.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        screen_backdrop.setGeometry(control.geometry())
+        screen_backdrop.setStyleSheet('background:#297ebb')
+        screen_backdrop.show();control.raise_();control.activateWindow()
+        try:
+            for mode in ('day','night'):
+                control.appearance_buttons[mode].click();QTest.qWait(150)
+                origin=W.POINT();assert client_origin(int(control.winId()),C.byref(origin))
+                scale=control.devicePixelRatioF();px=origin.x+round(12*scale);py=origin.y+round(200*scale)
+                color=ImageGrab.grab(bbox=(px,py,px+1,py+1),all_screens=True).getpixel((0,0))[:3]
+                assert sum(abs(a-b) for a,b in zip(color,(41,126,187)))>65, ('Settings screen backdrop missing',mode,color)
+            control.hide();QTest.qWait(3250)
+            assert settings_backdrop.released and settings_backdrop.view.texture_size==(0,0)
+            control.restore_settings()
+            deadline=time.perf_counter()+3
+            while not control.backdrop_active and time.perf_counter()<deadline:QTest.qWait(50)
+            QTest.qWait(100)
+            assert control.backdrop_active and settings_backdrop.view.ready
+            origin=W.POINT();assert client_origin(int(control.winId()),C.byref(origin))
+            px=origin.x+round(12*scale);py=origin.y+round(200*scale)
+            color=ImageGrab.grab(bbox=(px,py,px+1,py+1),all_screens=True).getpixel((0,0))[:3]
+            assert sum(abs(a-b) for a,b in zip(color,(41,126,187)))>65, ('Released settings backdrop did not recover',color)
+        finally:
+            screen_backdrop.close();screen_backdrop.deleteLater();calibration.show()
+        settings_frame = settings_backdrop.view.grabFramebuffer()
+        assert settings_frame.pixelColor(settings_frame.width()//2, settings_frame.height()//2).alpha() == 255
+        assert settings_frame.pixelColor(2, 2).alpha() == 0, "Settings corners expose a second background surface"
+        for mode in APPEARANCE_MODES:
+            control.appearance_buttons[mode].click(); QTest.qWait(100)
+            assert control.settings["appearance_mode"] == mode and control.windowOpacity() == 1
+            assert control.night == glass.view.night == settings_backdrop.view.night
+            assert control.appearance_buttons[mode].isChecked()
+            if preview_path:
+                control.grab().save(str(preview_path.with_name(f"settings-window-{mode}.png")))
+        control.appearance.setCurrentIndex(control.appearance.findData("day"))
+        control.minimize_settings(); QTest.qWait(50)
+        visible = api(user32, "IsWindowVisible", W.BOOL, W.HWND)
+        assert not control.isVisible() and not visible(int(control.winId())) and glass.isVisible()
+        assert not settings_backdrop.timer.isActive() and settings_backdrop.capture.size == (0, 0)
+        assert not hasattr(control, "tray") and not hasattr(control, "lock")
+        style = get_window_long(int(glass.winId()), -20)
+        assert style & 0x08000000 and not style & 0x00040000, "Lyric bar creates a taskbar entry"
+        QTest.mouseClick(glass, Qt.MouseButton.RightButton, pos=QPoint(80, 40)); QTest.qWait(50)
+        assert control.isVisible() and not control.isMinimized()
+        control.showMinimized(); QTest.qWait(50)
+        assert not control.isVisible() and glass.isVisible()
+        QTest.mouseClick(glass, Qt.MouseButton.RightButton, pos=QPoint(80, 40)); QTest.qWait(50)
+        assert control.isVisible() and not control.isMinimized()
+        control.showMinimized(); control.restore_settings(); QTest.qWait(50)
+        assert control.isVisible(), "A stale minimize hid restored Settings"
         control.restore_settings(); QTest.qWait(100)
-        with patch("moonlyrics.settings_ui.native_backdrop", return_value=False):
-            control.update_backdrop(); QTest.qWait(50)
-            fallback = control.grab().toImage()
-            ratio = fallback.devicePixelRatio()
-            pixel = fallback.pixelColor(round(15 * ratio), round(200 * ratio))
-            assert pixel.alpha() == 255 and pixel.getRgb()[:3] == MATERIALS["rich"][:3], pixel.getRgb()
-        control.update_backdrop()
+        settings_backdrop.stop(); settings_backdrop.view.hide()
+        control.backdrop_active = False; control.update(); QTest.qWait(50)
+        fallback = control.grab().toImage(); ratio = fallback.devicePixelRatio()
+        pixel = fallback.pixelColor(round(15*ratio), round(200*ratio))
+        assert pixel.alpha() == 255 and pixel.getRgb()[:3] == control.material[:3], pixel.getRgb()
+        settings_backdrop.view.show(); settings_backdrop.start(); QTest.qWait(150)
         scroll = control.scroll.verticalScrollBar()
         scroll.setValue(scroll.maximum()); QTest.qWait(100)
         assert scroll.value() == scroll.maximum()
-        assert control.status.isVisibleTo(control.scroll)
+        assert control.runtime_button.isVisibleTo(control.scroll)
+        control.runtime_button.click(); QTest.qWait(50)
+        assert control.runtime_menu.isVisible() and control.status.isVisibleTo(control.runtime_menu)
+        assert control.language.isVisibleTo(control.runtime_menu) and control.clear_lyrics_cache.isVisibleTo(control.runtime_menu)
+        control.runtime_menu.hide()
         scroll.setValue(0)
-        result["settings_ui"] = dict(fixed_material=True, icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
-                                      native_backdrop=control.backdrop_active, native_corner_tint=True,
-                                      shared_transparency=True, tray_minimize_restore=tray_available, taskbar_fallback=True)
+        result["settings_ui"] = dict(appearance_modes=list(APPEARANCE_MODES), icon=True, scroll=True, minimum_size=True, title_bar=True, opaque_fallback=True,
+                                      shared_glass=control.backdrop_active, shared_day_night=True,
+                                      hidden_sampling_stops=True, hidden_minimize=True,
+                                      approved_mockup_layout=True, advanced_controls_in_status=True,
+                                      real_screen_background=True,released_background_recovers=True)
+        control.hide()
+        QTest.mouseClick(glass, Qt.MouseButton.RightButton, pos=QPoint(80, 40)); QTest.qWait(50)
+        assert control.isVisible() and not control.isMinimized() and glass.drag_anchor is None
+        assert not glass.windowFlags() & Qt.WindowType.WindowTransparentForInput
+        result["settings_recovery"] = dict(hidden_minimize=True, lyric_right_click=True,
+            no_tray=True, no_hotkey=True, no_lock=True, stale_minimize_guard=True)
         for language in LANGUAGES:
             control.language.setCurrentIndex(control.language.findData(language)); QTest.qWait(100)
             assert control.scroll.widget().width() <= control.scroll.viewport().width(), f"Settings overflow in {language}"
             assert control.retry_lyrics.text() == translate(language, "重新匹配")
+            assert all(control.appearance.itemText(i) == translate(language, label)
+                       for i, label in enumerate(APPEARANCE_MODES.values()))
             assert control.lyric_timing.text() == translate(language, "标准")
             assert __version__ in control.version_label.text()
             if preview_path:
@@ -1622,14 +1664,12 @@ def self_test(app, control, report_path, preview_path):
                 origin = W.POINT(); assert client_origin(int(glass.winId()), C.byref(origin))
                 rect = W.RECT(); assert api(user32, "GetClientRect", W.BOOL, W.HWND, C.POINTER(W.RECT))(int(glass.winId()), C.byref(rect))
                 ImageGrab.grab(bbox=(origin.x, origin.y, origin.x + rect.right, origin.y + rect.bottom), all_screens=True).save(str(preview_path.with_name("hover-controls.png")))
-            glass.set_locked(True); glass.reveal_transport(True); QTest.qWait(210)
-            assert not glass.transport.isVisible() and glass.view.control_space == 0
-            glass.set_locked(False)
             glass.reveal_transport(False); QTest.qWait(210)
+            assert not glass.transport.isVisible() and glass.view.control_space == 0
         finally:
             control.media_reader = original_reader
             control.set_playback(original_playback)
-        result["media_controls"] = dict(hover_fade=True, lock_hides=True, command_routing=True,
+        result["media_controls"] = dict(hover_fade=True, command_routing=True,
                                         no_drag=True, private_capture_exclusion=True, shared_glass=True, aligned_outer_corners=True)
         glass.view.update(); QTest.qWait(100)
         result["renderer"] = glass.view.renderer
@@ -1638,16 +1678,18 @@ def self_test(app, control, report_path, preview_path):
         if preview_path:
             glass.view.grabFramebuffer().save(str(preview_path))
             control.grab().save(str(preview_path.with_name("glass-controls.png")))
-        if tray_available:
-            control.minimize_settings()  # Exercise shutdown while settings are hidden.
+            for mode in APPEARANCE_MODES:
+                parameters(appearance_mode=mode)
+                glass.view.grabFramebuffer().save(str(preview_path.with_name(f"material-{mode}.png")))
+        control.minimize_settings()  # Exercise shutdown while settings are hidden.
     except Exception as exc:
         LOG.exception("Self-test failed")
         result.update(ok=False, error=str(exc))
     finally:
         calibration.close(); control.close()
     if result.get("ok"):
-        assert not control.tray.isVisible() and not glass.isVisible()
-        result["settings_ui"]["tray_exit"] = True
+        assert not glass.isVisible()
+        result["settings_ui"]["hidden_settings_exit"] = True
     if report_path:
         report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=True), flush=True)
@@ -1655,6 +1697,7 @@ def self_test(app, control, report_path, preview_path):
 
 
 def main():
+    global APP_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--media-probe", action="store_true")
@@ -1662,11 +1705,29 @@ def main():
     parser.add_argument("--lyrics-album", default="", help=argparse.SUPPRESS)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--preview", type=Path)
+    parser.add_argument("--startup-probe", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    APP_DIR.mkdir(parents=True, exist_ok=True)
+    application_base = application_directory(sys.executable, Path(__file__).resolve().parents[1],
+        frozen=getattr(sys, "frozen", False), launcher_directory=os.environ.get("MOONLYRICS_LAUNCHER_DIRECTORY"))
+    try:
+        APP_DIR = data_directory(PREFERRED_APP_DIR, application_base)
+    except OSError:
+        message_box = api(user32, "MessageBoxW", C.c_int, W.HWND, W.LPCWSTR, W.LPCWSTR, W.UINT)
+        message_box(None, "MoonLyrics 无法写入数据目录，请解压到可写文件夹后重试。\n"
+                         "MoonLyrics cannot write its data folder. Extract it to a writable folder and try again.",
+                    "MoonLyrics", 0x10)
+        return 1
     logging.basicConfig(filename=APP_DIR / "MoonLyrics.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8")
     LOG.info("Starting MoonLyrics; frozen=%s", getattr(sys, "frozen", False))
+    if args.startup_probe:
+        assets = Path(__file__).resolve().parents[1] / "assets"
+        files = ("moonlyrics-icon.ico", "NotoSansSC-Black.otf", "Glasswork-LICENSE.txt", "Atrium-LICENSE.txt")
+        args.startup_probe.write_text(json.dumps(dict(
+            ok=all((assets / name).is_file() for name in files), version=__version__,
+            executable=sys.executable, application_directory=str(application_base), data_directory=str(APP_DIR),
+            bundled_assets=all((assets / name).is_file() for name in files)), ensure_ascii=False), encoding="utf-8")
+        return 0
     try:
         user32.SetProcessDpiAwarenessContext(C.c_void_p(-4))
     except AttributeError:
@@ -1689,7 +1750,7 @@ def main():
         return lyrics_probe(args.lyrics_probe, args.report, args.lyrics_album, APP_DIR / "cache" / "lyrics")
     settings = dict(DEFAULTS)
     if not args.self_test:
-        for directory in (APP_DIR, LEGACY_DIR):
+        for directory in dict.fromkeys((APP_DIR, PREFERRED_APP_DIR, LEGACY_DIR)):
             try:
                 settings = normalized(json.loads((directory / "settings.json").read_text(encoding="utf-8")))
                 break

@@ -1,4 +1,4 @@
-param([string]$Python = 'python')
+param([string]$Python = 'python', [switch]$Portable)
 $ErrorActionPreference = 'Stop'
 $moonOriginalPath = $env:PATH
 Push-Location $PSScriptRoot
@@ -28,19 +28,35 @@ VSVersionInfo(
   ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )
 "@ | Set-Content -LiteralPath $moonVersionFile -Encoding utf8
-    & $moonPython -m PyInstaller --noconfirm --clean --onefile --windowed --noupx `
+    # A one-folder payload avoids PyInstaller's hard dependency on TEMP at startup.
+    # The single-file launcher chooses a writable extraction location first.
+    & $moonPython -m PyInstaller --noconfirm --clean --onedir --windowed --noupx `
         --version-file $moonVersionFile `
         --icon (Join-Path $PSScriptRoot 'assets\moonlyrics-icon.ico') `
         --add-data "$(Join-Path $PSScriptRoot 'assets\moonlyrics-icon.ico');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\moonlyrics-icon.png');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\settings-chevron.svg');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\settings-chevron-dark.svg');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\settings-icons.json');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\Lucide-LICENSE.txt');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\settings-check.svg');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\NotoSansSC-Black.otf');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'assets\NotoSansSC-OFL.txt');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\Glasswork-LICENSE.txt');assets" `
+        --add-data "$(Join-Path $PSScriptRoot 'assets\Atrium-LICENSE.txt');assets" `
         --add-data "$(Join-Path $PSScriptRoot 'VERSION');." `
         --name MoonLyrics --collect-data opencc --distpath (Join-Path $PSScriptRoot 'dist') `
         --workpath (Join-Path $PSScriptRoot 'build') --specpath (Join-Path $PSScriptRoot 'build') main.py
     if ($LASTEXITCODE -ne 0) { throw 'MoonLyrics build failed.' }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md'), (Join-Path $PSScriptRoot 'README.zh-CN.md'), (Join-Path $PSScriptRoot 'LICENSE') -Destination (Join-Path $PSScriptRoot 'dist\MoonLyrics')
+    if (-not $Portable) {
+        & $moonPython (Join-Path $PSScriptRoot 'packaging\package_singlefile.py') `
+            --folder (Join-Path $PSScriptRoot 'dist\MoonLyrics') `
+            --output (Join-Path $PSScriptRoot 'dist\MoonLyrics.exe') `
+            --work (Join-Path $PSScriptRoot 'build\launcher') --version $moonVersion `
+            --icon (Join-Path $PSScriptRoot 'assets\moonlyrics-icon.ico')
+        if ($LASTEXITCODE -ne 0) { throw 'MoonLyrics single-file launcher build failed.' }
+    }
 } finally {
     $env:PATH = $moonOriginalPath
     Pop-Location

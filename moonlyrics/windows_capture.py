@@ -59,7 +59,11 @@ class _Sampler(threading.Thread):
         super().__init__(name="MoonLyrics desktop sampling", daemon=True)
         self.lock = threading.Lock()
         self.wake, self.stopping = threading.Event(), threading.Event()
-        self.pending = self.requested = self.latest = self.error = None
+        self.pending = self.latest = self.error = None
+        self.clients = set()
+        self.client_pending, self.client_latest = {}, {}
+        self.prefer_client = False
+        self.excluded_windows = ()
         self.serial = 0
         self.raw = None
         self.dimensions = (0, 0)
@@ -74,6 +78,8 @@ class _Sampler(threading.Thread):
 
     def run(self):
         host = child = None
+        filtered_windows = None
+        source_rect = None
         initialized = False
         try:
             checked(mag_initialize()); initialized = True
@@ -91,29 +97,51 @@ class _Sampler(threading.Thread):
             while not self.stopping.is_set():
                 self.wake.wait(.1)
                 with self.lock:
-                    job, self.pending = self.pending, None
+                    client = None
+                    if self.client_pending and (self.pending is None or self.prefer_client):
+                        client = next(iter(self.client_pending))
+                        job = self.client_pending.pop(client)
+                        self.prefer_client = False
+                    else:
+                        job, self.pending = self.pending, None
+                        self.prefer_client = True
                     self.wake.clear()
+                    if self.pending is not None or self.client_pending:
+                        self.wake.set()
+                    exclusions = self.excluded_windows
                 if self.stopping.is_set():
                     break
                 if job is not None:
                     started = time.perf_counter()
                     hwnd, x, y, width, height = job
-                    if self.dimensions != (width, height):
+                    resized = self.dimensions != (width, height)
+                    source_changed = source_rect != (x,y,width,height)
+                    windows = tuple(dict.fromkeys((*exclusions,hwnd,host)))
+                    filter_changed = windows != filtered_windows
+                    if resized:
                         checked(position_window(host, 1, 0, 0, width, height, 0x14))
                         checked(position_window(child, None, 0, 0, width, height, 0x1C))
                         self.dimensions = width, height
-                    checked(mag_filter(child, 0, 2, (W.HWND * 2)(hwnd, host)))
+                    if filter_changed:
+                        checked(mag_filter(child,0,len(windows),(W.HWND*len(windows))(*windows)))
+                        filtered_windows = windows
                     self.raw = None
                     checked(mag_source(child, W.RECT(x, y, x + width, y + height)))
-                    # Setting the source often delivers the frame already; avoid a second DWM wait.
-                    if self.raw is None:
+                    source_rect = x,y,width,height
+                    # A geometry/filter change can first deliver a provisional
+                    # black or old-position surface. Finish its redraw before publishing it.
+                    # The unchanged single-window path still avoids that wait.
+                    if source_changed or filter_changed or self.raw is None:
                         checked(invalidate(child, None, False)); checked(update_window(child))
                     if self.raw is None:
                         raise OSError("桌面取样未返回画面")
                     with self.lock:
-                        if job == self.requested:
-                            self.serial += 1
-                            self.latest = job, self.serial, self.raw, (time.perf_counter() - started) * 1000
+                        self.serial += 1
+                        frame = job, self.serial, self.raw, (time.perf_counter() - started) * 1000
+                        if client is None:
+                            self.latest = frame
+                        elif client in self.clients:
+                            self.client_latest[client] = frame
                 for _ in range(32):
                     if self.stopping.is_set() or not peek_message(C.byref(message), None, 0, 0, 1):
                         break
@@ -130,17 +158,65 @@ class _Sampler(threading.Thread):
             self.raw = None
 
 
+class _SamplerClient:
+    """One bounded mailbox on the lyric sampler, without a second native callback."""
+    def __init__(self, worker):
+        self.source = worker
+        self.key = object()
+        self.lock, self.wake = worker.lock, worker.wake
+        with self.lock:
+            worker.clients.add(self.key)
+
+    @property
+    def latest(self):
+        return self.source.client_latest.get(self.key)
+
+    @property
+    def error(self):
+        return self.source.error
+
+    @property
+    def pending(self):
+        return self.source.client_pending.get(self.key)
+
+    @pending.setter
+    def pending(self, value):
+        self.source.client_pending[self.key] = value
+
+    @property
+    def excluded_windows(self):
+        return self.source.excluded_windows
+
+    @excluded_windows.setter
+    def excluded_windows(self, value):
+        self.source.excluded_windows = value
+
+    def close(self):
+        with self.lock:
+            self.source.clients.discard(self.key)
+            self.source.client_pending.pop(self.key, None)
+            self.source.client_latest.pop(self.key, None)
+
+
 class DesktopRegion:
     """Keep a bounded latest-frame buffer; native sampling never blocks the Qt thread."""
-    def __init__(self):
+    def __init__(self, *, shared_with=None):
+        self.shared_with = shared_with
+        self.excluded_windows = ()
         self.worker = None
         self.buffer = None
+        self.top_down = True
         self.bits = C.c_void_p()
         self.size = (0, 0)
         self.bounds = (0., 0., 1., 1.)
         self.capture_ms = 0.
         self.serial = 0
+        self.revision = 0
+        self.source_rect = None
+        self.offset = (0, 0)
         self.request_key = None
+        self.request_shape = None
+        self.frame_key = None
         self.wait_since = 0.
         self.last_request_at = 0.
 
@@ -148,7 +224,7 @@ class DesktopRegion:
         if not self.close():
             raise OSError("后台桌面取样尚未结束")
 
-    def capture(self, hwnd, pad):
+    def capture(self, hwnd, pad, margin=0, refresh=True):
         rect, origin = W.RECT(), W.POINT()
         checked(client_rect(hwnd, C.byref(rect))); checked(client_origin(hwnd, C.byref(origin)))
         fw, fh = rect.right, rect.bottom
@@ -161,44 +237,100 @@ class DesktopRegion:
         right, bottom = min(x + width, vx + vw), min(y + height, vy + vh)
         if right <= sx or bottom <= sy:
             raise RuntimeError("玻璃条位于显示器范围外")
-        job = hwnd, sx, sy, right - sx, bottom - sy
+        left, top = max(vx, sx-margin), max(vy, sy-margin)
+        job = hwnd, left, top, min(vx+vw, right+margin)-left, min(vy+vh, bottom+margin)-top
+        if max(job[3:]) > 8192:
+            raise RuntimeError("无效的桌面取样尺寸")
         now = time.perf_counter()
-        if self.worker is None:
+        shape = fw, fh, pad, margin, vx, vy, vw, vh
+        guard = min(64, margin//4)
+        previous = self.request_key
+        anchored = (previous is not None and previous[0] == hwnd and self.request_shape == shape
+                    and previous[1] <= max(vx, sx-guard) and previous[2] <= max(vy, sy-guard)
+                    and previous[1]+previous[3] >= min(vx+vw, right+guard)
+                    and previous[2]+previous[4] >= min(vy+vh, bottom+guard))
+        if anchored:
+            job = previous
+        if self.shared_with is not None:
+            primary = self.shared_with
+            primary.ensure_shared_worker()
+            if self.worker is None or self.worker.source is not primary.worker:
+                if self.worker is not None:
+                    self.worker.close()
+                self.worker = _SamplerClient(primary.worker)
+                self.serial = 0
+                self.source_rect = self.frame_key = self.request_key = None
+                self.wait_since = now
+        elif self.worker is None:
             self.worker = _Sampler()
             self.worker.start()
             self.wait_since = now
-        if job != self.request_key or now - self.last_request_at > 1:
+        changed = job != self.request_key or self.request_shape != shape
+        if changed or now - self.last_request_at > 1:
             self.request_key = job
+            self.request_shape = shape
             self.wait_since = now
         self.last_request_at = now
         with self.worker.lock:
+            self.worker.excluded_windows = (self.shared_with.excluded_windows
+                                            if self.shared_with is not None else self.excluded_windows)
             if self.worker.error is not None:
                 raise OSError(self.worker.error)
             latest = self.worker.latest
-            self.worker.requested = self.worker.pending = job
-            self.worker.wake.set()
-        if latest is None or latest[0] != job or latest[1] == self.serial:
+            if refresh or changed or latest is None:
+                self.worker.pending = job
+                self.worker.wake.set()
+        frame_key = (latest[1], x, y, width, height) if latest else None
+        covers = (latest is not None and latest[0][0] == hwnd
+                  and latest[0][1] <= sx and latest[0][2] <= sy
+                  and latest[0][1]+latest[0][3] >= right and latest[0][2]+latest[0][4] >= bottom)
+        if not covers or frame_key == self.frame_key:
             if now - self.wait_since > 3:
                 raise OSError("桌面取样未更新")
             return None
-        self.serial = latest[1]
+        self.frame_key = frame_key
         self.wait_since = now
-        if self.size != (width, height):
-            self.buffer = C.create_string_buffer(width * height * 4)
-            self.bits = C.cast(self.buffer, C.c_void_p)
-            self.size = width, height
-        raw, stride = latest[2]
-        # Keep the renderer's existing bottom-up BGRA layout, including clipped monitor edges.
-        for row in range(bottom - sy):
-            offset = ((height - 1 - (sy - y + row)) * width + sx - x) * 4
-            C.memmove(self.bits.value + offset, raw[row * stride:row * stride + (right - sx) * 4], (right - sx) * 4)
-        self.bounds = ((sx - x + .5) / width, (height - (bottom - y) + .5) / height,
-                       (right - x - .5) / width, (height - (sy - y) - .5) / height)
+        if latest[1] != self.serial or latest[0] != self.source_rect:
+            previous_source = self.source_rect
+            self.serial = latest[1]
+            self.source_rect = latest[0]
+            cw, ch = latest[0][3:]
+            raw, stride = latest[2]
+            # Retain the native immutable owner; the GPU's first blur pass
+            # handles orientation instead of allocating/copying every row.
+            pixels = raw if stride == cw*4 else b''.join(raw[row*stride:row*stride+cw*4] for row in range(ch))
+            changed = previous_source != self.source_rect or self.buffer != pixels
+            self.buffer = pixels
+            self.bits = C.cast(C.c_char_p(pixels), C.c_void_p)
+            self.size = cw, ch
+            self.bounds = (.5/cw, .5/ch, 1-.5/cw, 1-.5/ch)
+            if changed:
+                self.revision += 1
+        source_x, source_y, cw, ch = self.source_rect[1:]
+        self.offset = origin.x-source_x, source_y+ch-origin.y-fh
         self.capture_ms = latest[3]
         return fw, fh, pad
 
+    def ensure_shared_worker(self):
+        worker = self.worker
+        if worker is not None and (worker.error is not None or worker.stopping.is_set()):
+            worker.stopping.set(); worker.wake.set(); worker.join(.3)
+            if worker.is_alive():
+                raise OSError("后台桌面取样尚未结束")
+            self.worker = None
+            # Keep published pixels alive until the next GPU upload.
+            self.serial = 0
+            self.source_rect = self.frame_key = self.request_key = None
+        if self.worker is None:
+            self.worker = _Sampler()
+            self.worker.start()
+            self.wait_since = time.perf_counter()
+
     def close(self):
-        if self.worker is not None:
+        if self.shared_with is not None and self.worker is not None:
+            self.worker.close()
+            self.worker = None
+        elif self.worker is not None:
             self.worker.stopping.set(); self.worker.wake.set()
             self.worker.join(.3)
             if self.worker.is_alive():
@@ -208,5 +340,9 @@ class DesktopRegion:
         self.bits = C.c_void_p()
         self.size = (0, 0)
         self.serial = 0
+        self.source_rect = None
+        self.offset = (0, 0)
         self.request_key = None
+        self.request_shape = None
+        self.frame_key = None
         return True

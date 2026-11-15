@@ -37,6 +37,16 @@ class LyricPaintTests(unittest.TestCase):
         self.assertEqual(info.weight(), QFont.Weight.Black)
         self.assertEqual(lyric_font("Segoe UI").weight(), QFont.Weight.Medium)
 
+    def test_reusing_the_viewport_buffer_keeps_identical_pixels_without_ghost_text(self):
+        document = Lyrics((LyricLine(0, '上一行'), LyricLine(5, '月光 Moonlight'), LyricLine(10, '下一行')))
+        first = lyric_layer(document, 0., 580, 80, 1.25, False, self.family, glass=True)
+        expected = lyric_layer(document, 1.2, 580, 80, 1.25, False, self.family, glass=True)
+        reused = lyric_layer(document, 1.2, 580, 80, 1.25, False, self.family, glass=True, target=first)
+        self.assertIs(reused, first)
+        self.assertEqual(reused.constBits().asstring(reused.sizeInBytes()), expected.constBits().asstring(expected.sizeInBytes()))
+        resized = lyric_layer(document, 1.2, 320, 80, 1., False, self.family, glass=True, target=first)
+        self.assertIsNot(resized, first)
+
     def test_fonts_and_display_scaling_keep_text_inside_a_faded_viewport(self):
         document = Lyrics((LyricLine(1, "上句淡去"), LyricLine(8, "月光 Moonlight 달빛 月明かり"),
                            LyricLine(16, "下句浮现")))

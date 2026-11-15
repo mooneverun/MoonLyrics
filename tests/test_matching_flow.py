@@ -92,10 +92,10 @@ class MatchingFlowTests(TestCase):
         stale = self.control.lyric_request
         self.worker.request.reset_mock()
         self.control.source_choices[0].setCurrentIndex(self.control.source_choices[0].findData("qq"))
-        self.assertEqual(self.control.settings["lyric_source_order"], ("qq", "lrclib", "netease", "kugou"))
+        self.assertEqual(self.control.settings["lyric_source_order"], ("qq", "lrclib", "netease"))
         self.control.source_choices[1].setCurrentIndex(self.control.source_choices[1].findData("netease"))
         QTest.qWait(750)
-        order = ("qq", "netease", "lrclib", "kugou")
+        order = ("qq", "netease", "lrclib")
         self.assertEqual(tuple(choice.currentData() for choice in self.control.source_choices), order)
         self.assertEqual(self.worker.request.call_count, 2)
         self.assertTrue(self.worker.request.call_args.args[3])

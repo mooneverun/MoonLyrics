@@ -45,8 +45,10 @@ def lyric_pan(document, position, width, family, end_time=None):
     return index, progress * progress * (3 - 2 * progress)
 
 
-def lyric_layer(document, scroll, width, height, dpr, dark, family=None, pan=None):
-    image = QImage(math.ceil(width * dpr), math.ceil(height * dpr), QImage.Format.Format_ARGB32_Premultiplied)
+def lyric_layer(document, scroll, width, height, dpr, dark, family=None, pan=None, *, glass=False, target=None):
+    size = (math.ceil(width*dpr), math.ceil(height*dpr))
+    image = target if (target is not None and (target.width(), target.height()) == size
+                       and target.format() == QImage.Format.Format_ARGB32_Premultiplied) else QImage(*size, QImage.Format.Format_ARGB32_Premultiplied)
     image.setDevicePixelRatio(dpr); image.fill(Qt.GlobalColor.transparent)
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -80,9 +82,13 @@ def lyric_layer(document, scroll, width, height, dpr, dark, family=None, pan=Non
         rect = QRectF(0, -metrics.height() / 2, advance + 2, metrics.height())
         opacity = round(56 + 194 * emphasis)
         flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine
-        painter.setPen(QColor(255, 255, 255, round(opacity * .14)) if dark else QColor(0, 0, 0, round(opacity * .16)))
-        painter.drawText(rect.translated(0, .7), flags, text)
-        painter.setPen(QColor(24, 38, 50, opacity) if dark else QColor(250, 253, 255, opacity))
+        if glass:
+            opacity = round((56 + 199 * emphasis) * (.86 if dark else .94))
+            painter.setPen(QColor(0, 0, 0, opacity) if dark else QColor(255, 255, 255, opacity))
+        else:
+            painter.setPen(QColor(255, 255, 255, round(opacity * .14)) if dark else QColor(0, 0, 0, round(opacity * .16)))
+            painter.drawText(rect.translated(0, .7), flags, text)
+            painter.setPen(QColor(24, 38, 50, opacity) if dark else QColor(250, 253, 255, opacity))
         painter.drawText(rect, flags, text)
         painter.restore()
     painter.setClipping(False)

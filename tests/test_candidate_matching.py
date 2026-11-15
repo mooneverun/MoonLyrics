@@ -42,6 +42,29 @@ class CandidateMatchingTests(TestCase):
         self.finder._json = Mock(side_effect=self.response)
         return self.finder.find(self.target, source_order=("netease", "qq", "lrclib", "kugou"))
 
+    def test_only_three_enabled_sources_run_including_alias_fallbacks(self):
+        from moonlyrics.styles import LYRIC_SOURCES
+        for reserve in LYRIC_SOURCES:
+            with self.subTest(reserve=reserve):
+                for source in LYRIC_SOURCES:
+                    setattr(self.finder, "_"+source, Mock(return_value=None))
+                self.finder._aliases = Mock(return_value=[self.target])
+                self.finder._album_aliases = Mock(return_value=None)
+                self.finder._resolve_candidates = Mock(return_value=None)
+                self.finder._catalog_aliases = Mock(return_value=None)
+                self.finder._json = Mock(side_effect=AssertionError("Unexpected network request"))
+                active = tuple(source for source in LYRIC_SOURCES if source != reserve)
+                self.assertIsNone(self.finder.find(self.target, force=True, source_order=active)[0])
+                getattr(self.finder, "_"+reserve).assert_not_called()
+                for source in active:
+                    getattr(self.finder, "_"+source).assert_called()
+                if reserve == "kugou":
+                    self.finder._catalog_aliases.assert_not_called()
+                else:
+                    self.finder._catalog_aliases.assert_called_once()
+                if reserve == "netease":
+                    self.finder._album_aliases.assert_not_called()
+
     def test_partial_bilingual_title_is_verified_with_album_full_artists_and_precise_timing(self):
         document, _ = self.find()
         self.assertIsNotNone(document)

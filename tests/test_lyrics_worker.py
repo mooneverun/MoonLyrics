@@ -124,7 +124,7 @@ class WorkerTests(TestCase):
         finder.close.assert_called_once()
 
     def test_retries_preserve_the_source_order_snapshot(self):
-        order = ["qq", "netease", "kugou", "lrclib"]
+        order = ["qq", "netease", "kugou"]
         expected = tuple(order)
         finder = Mock()
         finder.find.side_effect = [(None, "暂未找到"), (Lyrics((LyricLine(1, "月光"),), "测试"), "已匹配")]
@@ -132,7 +132,7 @@ class WorkerTests(TestCase):
         self.assertEqual([call.args[4] for call in finder.find.call_args_list], [expected, expected])
 
     def test_changing_priority_interrupts_the_old_scheduled_retry(self):
-        new_order = ("netease", "qq", "kugou", "lrclib")
+        new_order = ("netease", "qq", "kugou")
         document = Lyrics((LyricLine(1, "月光"),), "网易云音乐")
         finder = Mock()
         finder.find.side_effect = lambda track, store, cancel, force, order: (document, "已匹配") if order == new_order else (None, "暂未找到")

@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from moonlyrics.lyrics import LyricCandidate, Lyrics, LyricsFinder, LyricLine, SearchCancelled, Track
-from moonlyrics.styles import DEFAULTS, lyric_offset_seconds
+from moonlyrics.styles import DEFAULTS, LYRIC_SOURCES, lyric_offset_seconds
 
 
 class LyricCacheTests(unittest.TestCase):
@@ -23,7 +23,7 @@ class LyricCacheTests(unittest.TestCase):
     def finder(self, success=True):
         finder = LyricsFinder(Path(self.directory.name) / "lyrics")
         self.addCleanup(finder.close)
-        for source in self.order:
+        for source in LYRIC_SOURCES:
             setattr(finder, "_" + source, Mock(return_value=None))
         finder._aliases = Mock(side_effect=lambda track, store: [track])
         finder._album_aliases = Mock(return_value=None)
@@ -82,12 +82,20 @@ class LyricCacheTests(unittest.TestCase):
     def test_priority_change_searches_again_instead_of_reusing_other_order(self):
         self.seed()
         second = self.finder()
-        order = ("qq", "kugou", "netease", "lrclib")
+        order = ("qq", "kugou", "netease")
         found, _ = second.find(self.track, source_order=order)
         self.assertEqual(found, self.document)
         second._qq.assert_called()
         second._kugou.assert_called_once()
         self.assertEqual(second.diagnostics["outcome"], "matched")
+
+    def test_disabled_source_is_not_loaded_from_cache_or_used_as_a_fallback(self):
+        self.seed()
+        finder = self.finder(False)
+        active = ("qq", "netease", "lrclib")
+        self.assertIsNone(finder.find(self.track, source_order=active)[0])
+        finder._kugou.assert_not_called()
+        finder._catalog_aliases.assert_not_called()
 
     def test_force_refresh_replaces_success_and_failure_preserves_previous_success(self):
         first = self.seed()

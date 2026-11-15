@@ -62,8 +62,7 @@ class SettingsControlsTests(unittest.TestCase):
         cls.app.setQuitOnLastWindowClosed(False)
 
     def setUp(self):
-        with patch.object(native.QSystemTrayIcon, "show"):
-            self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
+        self.control = native.Controls(dict(DEFAULTS), save=False, media=False)
         for timer in self.control.findChildren(QTimer):
             timer.stop()
         self.control.glass.paused = True
@@ -71,7 +70,6 @@ class SettingsControlsTests(unittest.TestCase):
     def tearDown(self):
         for timer in self.control.findChildren(QTimer):
             timer.stop()
-        self.control.tray.hide()
         self.control.glass.close()
         self.control.glass.deleteLater()
         self.control.deleteLater()
@@ -79,6 +77,61 @@ class SettingsControlsTests(unittest.TestCase):
 
     def language(self, code):
         self.control.language.setCurrentIndex(self.control.language.findData(code))
+
+    def test_appearance_modes_preserve_playback_and_language_while_refresh_is_paused(self):
+        document = Lyrics((LyricLine(1, "Moonlight 月光"), LyricLine(8, "Next")))
+        self.control.set_playback(PlaybackSnapshot(status="paused", position=1, duration=20))
+        self.control.glass.view.set_lyrics(document, 2.)
+        self.assertNotIn("transparency_level", self.control.sliders)
+        self.assertEqual([self.control.appearance.itemData(i) for i in range(3)], ["day", "night", "system"])
+        with patch.object(self.control, "request_lyrics") as search:
+            for mode in ("day", "night", "system"):
+                self.control.appearance.setCurrentIndex(self.control.appearance.findData(mode))
+                self.assertEqual(self.control.settings["appearance_mode"], mode)
+                original = dict(self.control.settings)
+                for language in LANGUAGES:
+                    self.language(language)
+                    self.assertEqual(self.control.appearance.currentText(),
+                                     translate(language, native.APPEARANCE_MODES[mode]))
+                    self.assertEqual(self.control.settings, original | {"language": language})
+                    self.assertIs(self.control.glass.view.lyrics, document)
+                    self.assertEqual(self.control.glass.view.lyric_time, 2.)
+                    self.assertTrue(self.control.glass.paused)
+                    self.assertEqual(normalized(json.loads(json.dumps(self.control.settings))), self.control.settings)
+            search.assert_not_called()
+
+    def test_system_mode_follows_theme_changes_and_explicit_modes_override_them(self):
+        view = self.control.glass.view
+        with patch.object(native, "system_is_dark", return_value=False):
+            view.update_appearance()
+            self.assertTrue(view.dark_text)
+        with patch.object(native, "system_is_dark", return_value=True):
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
+            self.assertFalse(view.dark_text)
+            self.control.appearance.setCurrentIndex(self.control.appearance.findData("day"))
+            self.assertTrue(view.dark_text)
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
+            self.assertTrue(view.dark_text)
+        self.control.appearance.setCurrentIndex(self.control.appearance.findData("night"))
+        with patch.object(native, "system_is_dark", return_value=False):
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
+            self.assertFalse(view.dark_text)
+            self.control.appearance.setCurrentIndex(self.control.appearance.findData("system"))
+            self.assertTrue(view.dark_text)
+
+    def test_settings_share_the_lyric_theme_and_have_a_readable_native_fallback(self):
+        colors = []
+        for mode in ("day", "night"):
+            self.control.appearance_buttons[mode].click()
+            self.assertEqual(self.control.night, mode == 'night')
+            self.assertEqual(self.control.glass.view.night, self.control.night)
+            self.assertEqual(self.control.settings_backdrop.view.night, self.control.night)
+            colors.append(self.control.material)
+            self.assertEqual(self.control.material[3], 255)
+            self.assertTrue(self.control.appearance_buttons[mode].isChecked())
+            self.control.appearance_buttons[mode].click()
+            self.assertTrue(self.control.appearance_buttons[mode].isChecked())
+        self.assertNotEqual(colors[0], colors[1])
 
     def test_font_switch_updates_lyrics_without_searching_or_changing_ui_font(self):
         document = Lyrics((LyricLine(1, "Moonlight 月光 달빛"), LyricLine(8, "下一句")))
@@ -128,7 +181,7 @@ class SettingsControlsTests(unittest.TestCase):
         self.assertEqual(view.lyric_end_time, 11.)
         self.assertEqual(view.pan_position, (0, 1.))
 
-    def test_live_switch_covers_static_dynamic_and_tray_text_without_searching_again(self):
+    def test_live_switch_covers_static_dynamic_and_interaction_text_without_searching_again(self):
         self.control.set_playback(PlaybackSnapshot(title="等待 Apple Music", artist="歌手 Artist 가수", album="繁體專輯",
                                                   status="paused", position=30, duration=180))
         document = Lyrics((LyricLine(1, "歌詞 그대로"),), "网易云音乐", "等待 Apple Music", "歌手 Artist 가수")
@@ -140,8 +193,9 @@ class SettingsControlsTests(unittest.TestCase):
                 self.language(language)
                 self.assertEqual(self.control.retry_lyrics.text(), translate(language, "重新匹配"))
                 self.assertEqual(self.control.clear_lyrics_cache.text(), translate(language, "清空歌词缓存"))
-                self.assertEqual(self.control.position_buttons[1].text(), translate(language, "顶部居中"))
-                self.assertEqual(self.control.tray_menu.actions()[0].text(), translate(language, "打开设置"))
+                self.assertEqual(self.control.position_buttons[1].text(), translate(language, "上方"))
+                self.assertEqual(self.control.interaction_hint.text(), translate(language,
+                    "按住歌词条可拖动；右键歌词条打开设置。最小化后设置窗口隐藏。"))
                 self.assertEqual(self.control.storefront.currentText(), translate(language, "土耳其"))
                 self.assertEqual(self.control.media_status.text(), translate(language, "已暂停"))
                 self.assertEqual(self.control.lyric_timing.text(), translate(language, "标准"))
@@ -198,6 +252,8 @@ class SettingsControlsTests(unittest.TestCase):
         self.assertEqual(self.control.settings["width"], 960)
 
     def test_120_fps_is_selectable_and_preserves_capture_recovery_rate(self):
+        self.control.glass.move(-30000, -30000)
+        self.control.glass.show()
         self.control.glass.paused = False
         self.control.fps.setCurrentIndex(self.control.fps.findData(120))
         self.assertEqual(self.control.settings["fps"], 120)

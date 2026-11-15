@@ -226,7 +226,7 @@ class SourcePriorityTests(TestCase):
         self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
 
     def test_every_priority_order_falls_back_in_the_chosen_sequence(self):
-        for order in permutations(LYRIC_SOURCES):
+        for order in permutations(LYRIC_SOURCES, 3):
             calls = []
             def search(source):
                 def run(*args, **kwargs):
@@ -486,7 +486,7 @@ class AnonymousSourceTests(TestCase):
         self.finder._aliases = Mock(return_value=[self.track])
         self.finder._catalog_aliases = Mock(side_effect=lambda aliases: aliases)
         with patch("moonlyrics.lyrics.time.monotonic", side_effect=lambda: clock[0]):
-            result, _ = self.finder.find(self.track)
+            result, _ = self.finder.find(self.track, source_order=("kugou", "netease", "qq"))
         self.assertIs(result, document)
 
     def test_korean_aliases_are_verified_by_the_same_apple_id(self):

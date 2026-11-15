@@ -277,7 +277,7 @@ class ReportedSongReplayTests(TestCase):
                 finder._json = Mock(side_effect=replay)
                 values = {key: value for key, value in case["input"].items() if key != "title_aliases"}
                 try:
-                    document, message = finder.find(Track(**values), source_order=("netease", "qq", "lrclib", "kugou"))
+                    document, message = finder.find(Track(**values), source_order=("netease", "qq", "kugou"))
                     self.assertEqual(document is not None, case["expected_found"], message)
                     if document is not None:
                         self.assertEqual(document.source, case["expected_source"])
